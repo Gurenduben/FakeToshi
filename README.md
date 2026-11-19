@@ -184,6 +184,83 @@ Details that matter:
 - **Testnet/regtest only for real use.** Never paste a mainnet key into a tool
   you have not audited, and remember these are hot keys.
 
+### The real signature-forgery condition: the SIGHASH_SINGLE bug
+
+The other half of the story is a *genuine* signature-forgery bug, not an
+existential one. With `SIGHASH_SINGLE` a signature commits to input `i` and
+output `i`. When the transaction has **no output at index `i`**, Bitcoin Core's
+`SignatureHash` returns the constant `uint256::ONE` — the bytes `01 00 … 00`,
+i.e. `2**248` — instead of a hash of the transaction.
+
+A signature over that constant is valid for **every** transaction that keeps the
+input at an index without a matching output, so it commits to no amount,
+destination or other input. Anyone who obtains such a signature can spend the
+coin anywhere. This is the flaw behind the BitPay/Copay multisig losses.
+
+```
+$ python -m faketoshi sighash-single-demo
+SIGHASH_SINGLE bug demonstration
+================================
+wallet (2-of-3 P2SH multisig)
+  redeemScript: 5221020463...
+  address:      355ruwEdjxaxYsecyiBgBBNRBEqQn3knut
+
+step 1 - a transaction where input 1 has no matching output
+  inputs: 2, outputs: 1
+  digest for input 0 (SIGHASH_ALL):    8106667232...dc2087
+  digest for input 1 (SIGHASH_SINGLE): uint256::ONE (01 00 ... 00)
+  -> the bug: the digest is the constant uint256::ONE, not a hash
+
+step 2 - a *different* transaction, built by someone else
+  destination: 16Y48h9KAzppPPER9weEcuzHFEagjkPZh7
+  scriptSig: 00483045022100e3595770...
+
+step 3 - verification
+  signature 0 valid in the attacker tx: True
+  signature 1 valid in the attacker tx: True
+  same signature with SIGHASH_ALL valid in the attacker tx: False
+```
+
+The same signature, lifted out of the first transaction, validates in a second
+one that pays a different address — and the `SIGHASH_ALL` comparison shows the
+signature failing to carry over, which is exactly the protection the bug
+removes. The demonstration is entirely offline on synthetic outpoints.
+
+Details that matter:
+
+- **`uint256::ONE` is `2**248`, not the integer `1`** in ECDSA terms, because it
+  is the 32 bytes `01 00…00` read big-endian. Implementations that use `1` here
+  describe the bug loosely but compute the wrong digest.
+- **Segwit v0 (BIP143) does not have this bug**: a missing matching output just
+  means a zero `hashOutputs`, so the signature still commits to the transaction.
+- Fixes are simple: never sign `SIGHASH_SINGLE`, require
+  `len(outputs) >= len(inputs)`, and prefer `SIGHASH_ALL`/segwit.
+- `analyse_sighash_single(tx, prevouts)` scans a raw transaction for
+  `SIGHASH_SINGLE` signatures and reports whether the bug condition triggers.
+
+`scriptsig`, `redeemscript`, `pubkey`, `decodesig` and `serialize` mirror the
+inspection helpers of the reference tooling this was modelled on. For example,
+the article's 2-of-3 script decodes to its published address:
+
+```
+$ python -m faketoshi redeemscript 5221023927b5cd...53ae
+2-of-3 multisig redeemScript
+  key 0: 023927b5cd7facefa7b85d02f73d1e1632b3aaf8dd15d4f9f359e37e39f0561196
+  ...
+  hash160: 06612b7cb2027e80ec340f9e02ffe4a9a59ba762
+  P2SH spk: a91406612b7cb2027e80ec340f9e02ffe4a9a59ba76287
+$ python -m faketoshi decode <that spk as an output>
+output 0: 300000 sats -> 32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe
+```
+
+⚠️ A note on the reference material: the article it is modelled on
+(`demining/Digital-Signature-Forgery-Attack`) mixes the genuine SIGHASH_SINGLE
+bug with claims about CVE-2025-29774/29775, which are **XML signature
+verification bypasses in the Node.js `xml-crypto` library** — unrelated to
+Bitcoin. Its notebook only shells out to a prebuilt binary downloaded from a
+third-party site. Nothing here executes that binary or relies on it; all the
+cryptography is this repository's own, checked against the vectors above.
+
 ### As a library
 
 ```python
@@ -253,9 +330,12 @@ Signing and transactions are separate from the forgery code:
 | `faketoshi/signing.py` | RFC 6979 nonces, `sign_z`/`verify_z`, DER, legacy and BIP143 sighashes, tx parsing/serialisation, `txid`/`wtxid` |
 | `faketoshi/wallet.py` | address ↔ script, WIF, `build_transaction`, `sign_raw_transaction`, `make_unsigned` |
 | `faketoshi/encoding.py` | hashes (incl. pure-Python RIPEMD160 fallback), varints, base58check, bech32 |
+| `faketoshi/sighash_single.py` | multisig scripts, scriptSig parsing, the SIGHASH_SINGLE demo, `analyse_sighash_single`, `replay_signature` |
 
 Signatures and sighashes were cross-checked against the third-party
 `python-bitcointx` library: identical digests and txids, and the emitted DER
-signatures verify independently. The curve is
+signatures verify independently. The SIGHASH_SINGLE behaviour follows Bitcoin
+Core's `SignatureHash` (`src/script/interpreter.cpp`) and `uint256::ONE`
+(`src/uint256.cpp`). The curve is
 fixed to secp256k1 (the only curve the original used), and a public key point
 that is not on the curve raises `ValueError` instead of producing garbage.

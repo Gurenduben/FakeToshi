@@ -35,8 +35,12 @@ SIGHASH_NONE = 0x02
 SIGHASH_SINGLE = 0x03
 SIGHASH_ANYONECANPAY = 0x80
 
-#: The value ECDSA implementations return for the broken SIGHASH_SINGLE case.
-SIGHASH_SINGLE_BUG_DIGEST = 1
+#: Bitcoin Core's ``uint256::ONE``: the bytes ``01 00 00 ... 00``.  For the
+#: broken SIGHASH_SINGLE case ``SignatureHash`` returns this constant instead of
+#: a hash, and it is consumed as a big-endian 256-bit value, i.e. ``2**248``
+#: (not the integer 1).
+HASH_ONE = b'\x01' + b'\x00' * 31
+SIGHASH_SINGLE_BUG_DIGEST = int.from_bytes(HASH_ONE, 'big')  # 2**248
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +333,10 @@ class Transaction:
         base = sighash_type & 0x1F
         anyonecanpay = bool(sighash_type & SIGHASH_ANYONECANPAY)
 
+        if not 0 <= index < len(self.inputs):
+            raise ValueError('input index %d out of range' % index)
         if base == SIGHASH_SINGLE and index >= len(self.outputs):
+            # Bitcoin Core: return uint256::ONE for the "nOut out of range" case.
             return SIGHASH_SINGLE_BUG_DIGEST
 
         inputs = [self.inputs[index]] if anyonecanpay else list(self.inputs)
@@ -377,8 +384,8 @@ class Transaction:
         base = sighash_type & 0x1F
         anyonecanpay = bool(sighash_type & SIGHASH_ANYONECANPAY)
 
-        if base == SIGHASH_SINGLE and index >= len(self.outputs):
-            return SIGHASH_SINGLE_BUG_DIGEST
+        if not 0 <= index < len(self.inputs):
+            raise ValueError('input index %d out of range' % index)
 
         zero = b'\x00' * 32
         hash_prevouts = (
@@ -393,9 +400,11 @@ class Transaction:
         )
         if base == SIGHASH_ALL:
             hash_outputs = dsha256(b''.join(o.serialize() for o in self.outputs))
-        elif base == SIGHASH_SINGLE:
+        elif base == SIGHASH_SINGLE and index < len(self.outputs):
             hash_outputs = dsha256(self.outputs[index].serialize())
         else:
+            # BIP143 has no constant-digest bug: a missing matching output just
+            # means hashOutputs is the zero hash.
             hash_outputs = zero
 
         txin = self.inputs[index]

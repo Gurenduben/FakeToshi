@@ -11,6 +11,17 @@ from .curve import (
     point_from_x,
     point_mul,
 )
+from .sighash_single import (
+    MultisigWallet,
+    analyse_sighash_single,
+    demonstrate_sighash_single_bug,
+    multisig_redeem_script,
+    multisig_script_sig,
+    p2sh_script,
+    parse_multisig_redeem_script,
+    parse_script_sig,
+    replay_signature,
+)
 from .signing import (
     SIGHASH_ALL,
     SIGHASH_ANYONECANPAY,
@@ -49,6 +60,15 @@ from .faketoshi import (
 )
 
 __all__ = [
+    'MultisigWallet',
+    'analyse_sighash_single',
+    'demonstrate_sighash_single_bug',
+    'multisig_redeem_script',
+    'multisig_script_sig',
+    'p2sh_script',
+    'parse_multisig_redeem_script',
+    'parse_script_sig',
+    'replay_signature',
     'SIGHASH_ALL',
     'SIGHASH_ANYONECANPAY',
     'SIGHASH_NONE',

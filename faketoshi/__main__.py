@@ -181,6 +181,54 @@ def build_parser() -> argparse.ArgumentParser:
     signraw.add_argument('--sighash', type=lambda v: int(v, 0), default=0x01)
     signraw.add_argument('--json', action='store_true')
 
+    # -- the SIGHASH_SINGLE bug (CVE-style signature forgery) --------------
+
+    attack = subparsers.add_parser(
+        'sighash-single-demo',
+        help='demonstrate the SIGHASH_SINGLE bug: replay one signature into another tx',
+        description=(
+            'Build a transaction where a SIGHASH_SINGLE input has no matching output '
+            '(so the digest is the constant 1), then reuse that signature in a '
+            'different transaction paying a different address. Offline demonstration.'
+        ),
+    )
+    attack.add_argument('--network', default='mainnet')
+    attack.add_argument('--destination', default='', help='attacker payout address')
+    attack.add_argument('--json', action='store_true')
+
+    scriptsig = subparsers.add_parser(
+        'scriptsig', help='decode a scriptSig (as printed by the reference tooling)'
+    )
+    scriptsig.add_argument('script', help='scriptSig hex (0x optional)')
+    scriptsig.add_argument('--redeem-script', help='redeemScript hex, to describe a P2SH spend')
+
+    redeemscript = subparsers.add_parser(
+        'redeemscript', help='decode a multisig redeemScript or P2SH spk'
+    )
+    redeemscript.add_argument('script', help='redeemScript (or P2SH scriptPubKey) hex')
+
+    pubkey = subparsers.add_parser(
+        'pubkey', help='decode a public key (hex) or a P2PK scriptPubKey'
+    )
+    pubkey.add_argument('key', help='33/65-byte public key hex, or a P2PK script')
+
+    decodesig = subparsers.add_parser(
+        'decodesig', help='decode a DER signature (with or without sighash byte)'
+    )
+    decodesig.add_argument('signature', help='DER signature hex')
+
+    serialize = subparsers.add_parser(
+        'serialize', help='re-encode JSON transaction fields as raw hex'
+    )
+    serialize.add_argument('--txid', required=True, help='previous txid')
+    serialize.add_argument('--vout', type=int, default=0)
+    serialize.add_argument('--value', type=int, required=True, help='output value in sats')
+    serialize.add_argument('--script', required=True, help='output scriptPubKey hex')
+    serialize.add_argument('--input-script', default='', help='scriptSig hex for the input')
+    serialize.add_argument('--sequence', type=lambda v: int(v, 0), default=0xFFFFFFFF)
+    serialize.add_argument('--version', type=int, default=2)
+    serialize.add_argument('--locktime', type=int, default=0)
+
     decode = subparsers.add_parser('decode', help='decode a raw transaction')
     decode.add_argument('raw', help='raw transaction hex')
     decode.add_argument('--network', default='mainnet')
@@ -473,7 +521,183 @@ def _decode(args) -> int:
     return 0
 
 
+def _analyse(args) -> int:
+    from .sighash_single import demonstrate_sighash_single_bug
+
+    try:
+        demo = demonstrate_sighash_single_bug(destination=args.destination, network=args.network)
+    except ValueError as exc:
+        return _fail(exc)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    'wallet': {
+                        'redeem_script': demo.wallet.redeem_script.hex(),
+                        'address': demo.wallet.address(args.network),
+                        'm': demo.wallet.m,
+                        'n': len(demo.wallet.pubkeys),
+                    },
+                    'victim': {
+                        'txid': demo.victim_txid,
+                        'hex': demo.victim_tx.hex(),
+                        'digest_input0_all': '%064x' % demo.victim_digests[0],
+                        'digest_input1_single': demo.victim_digests[1],
+                        'signatures': [
+                            {'r': str(r), 's': str(s)} for r, s in demo.victim_signatures
+                        ],
+                    },
+                    'attacker': {
+                        'txid': demo.attacker_txid,
+                        'hex': demo.attacker_tx.hex(),
+                        'script_sig': demo.attacker_script_sig.hex(),
+                        'destination': demo.destination,
+                        'signatures_valid': demo.attacker_verifications,
+                    },
+                    'sighash_all_comparison_valid': demo.all_sighash_contrast,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(demo.report())
+    return 0
+
+
+def _scriptsig(args) -> int:
+    from .sighash_single import parse_multisig_redeem_script, parse_script_sig
+
+    try:
+        items = parse_script_sig(bytes.fromhex(args.script[2:] if args.script[:2].lower() == '0x' else args.script))
+    except ValueError as exc:
+        return _fail(exc)
+
+    print('pushed items: %d' % len(items))
+    for i, item in enumerate(items):
+        if item is None:
+            print('  [%d] OP_0' % i)
+            continue
+        print('  [%d] %d bytes: %s' % (i, len(item), item.hex()))
+        try:
+            r, s, sighash_type = der_decode(item)
+            print('       signature: r=%d s=%d sighash=0x%02x' % (r, s, sighash_type or 0))
+        except ValueError:
+            pass
+    if args.redeem_script:
+        try:
+            m, n, keys = parse_multisig_redeem_script(bytes.fromhex(args.redeem_script))
+        except ValueError as exc:
+            return _fail(exc)
+        print('redeemScript: %d-of-%d multisig' % (m, n))
+        for i, key in enumerate(keys):
+            print('  key %d: %s' % (i, key.hex()))
+    return 0
+
+
+def _redeemscript(args) -> int:
+    from .sighash_single import parse_multisig_redeem_script, p2sh_script
+    from .encoding import hash160
+
+    text = args.script[2:] if args.script[:2].lower() == '0x' else args.script
+    try:
+        raw = bytes.fromhex(text)
+        if len(raw) == 23 and raw[0] == 0xA9 and raw[-1] == 0x87:
+            print('P2SH scriptPubKey for script hash %s' % raw[2:22].hex())
+            return 0
+        m, n, keys = parse_multisig_redeem_script(raw)
+    except ValueError as exc:
+        return _fail(exc)
+    print('%d-of-%d multisig redeemScript' % (m, n))
+    for i, key in enumerate(keys):
+        print('  key %d: %s' % (i, key.hex()))
+    print('  hash160: %s' % hash160(raw).hex())
+    print('  P2SH spk: %s' % p2sh_script(raw).hex())
+    return 0
+
+
+def _pubkey(args) -> int:
+    from .encoding import hash160, p2pkh_address, p2wpkh_address
+
+    text = args.key[2:] if args.key[:2].lower() == '0x' else args.key
+    try:
+        raw = bytes.fromhex(text)
+        if len(raw) in (35, 67) and raw[0] in (0x21, 0x41):
+            raw = raw[1:-1]  # unwrap a P2PK script
+        point = decode_point(raw)
+    except ValueError as exc:
+        return _fail(exc)
+    print('public key:  %s' % raw.hex())
+    print('compressed:  %s' % ('yes' if len(raw) == 33 else 'no'))
+    print('x:           %064x' % point[0])
+    print('y:           %064x' % point[1])
+    print('hash160:     %s' % hash160(raw).hex())
+    print('p2pkh:       %s' % p2pkh_address(raw))
+    print('p2wpkh:      %s' % p2wpkh_address(raw))
+    return 0
+
+
+def _decodesig(args) -> int:
+    text = args.signature[2:] if args.signature[:2].lower() == '0x' else args.signature
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        return _fail(ValueError('signature is not valid hex'))
+    try:
+        r, s, sighash_type = der_decode(raw)
+    except ValueError:
+        try:
+            r, s, sighash_type = der_decode(raw, has_sighash_byte=False)
+        except ValueError as exc:
+            return _fail(exc)
+    print('r:        %d' % r)
+    print('s:        %d' % s)
+    print('r (hex):  %064x' % r)
+    print('s (hex):  %064x' % s)
+    print('sighash:  %s' % ('0x%02x' % sighash_type if sighash_type is not None else 'absent'))
+    return 0
+
+
+def _serialize(args) -> int:
+    from .signing import Transaction, TxIn, TxOut
+
+    def unhex(text: str, what: str) -> bytes:
+        cleaned = text[2:] if text[:2].lower() == '0x' else text
+        try:
+            return bytes.fromhex(cleaned)
+        except ValueError:
+            raise ValueError('%s is not valid hex' % what) from None
+
+    try:
+        if len(args.txid) != 64:
+            raise ValueError('--txid must be 64 hex characters')
+        int(args.txid, 16)
+        tx = Transaction(
+            version=args.version,
+            inputs=[
+                TxIn(
+                    prev_txid=args.txid.lower(),
+                    prev_vout=args.vout,
+                    sequence=args.sequence,
+                    script_sig=unhex(args.input_script, '--input-script') if args.input_script else b'',
+                )
+            ],
+            outputs=[TxOut(value=args.value, script_pubkey=unhex(args.script, '--script'))],
+            locktime=args.locktime,
+        )
+    except ValueError as exc:
+        return _fail(exc)
+    print(tx.hex())
+    print('txid: %s' % tx.txid())
+    return 0
+
+
 _HANDLERS = {
+    'sighash-single-demo': _analyse,
+    'scriptsig': _scriptsig,
+    'redeemscript': _redeemscript,
+    'pubkey': _pubkey,
+    'decodesig': _decodesig,
+    'serialize': _serialize,
     'keygen': _keygen,
     'address': _address,
     'sign': _sign,

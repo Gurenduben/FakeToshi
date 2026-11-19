@@ -199,12 +199,28 @@ class SighashTest(unittest.TestCase):
         self.assertEqual(len(others), 4)
         self.assertNotIn(base, others)
 
-    def test_sighash_single_bug_returns_one(self):
+    def test_sighash_single_bug_returns_uint256_one(self):
         tx = parse_transaction(bytes.fromhex(BIP143_1_UNSIGNED))
-        self.assertEqual(tx.sighash_legacy(5, BIP143_1_P2PK_SCRIPTPUBKEY, SIGHASH_SINGLE), 1)
+        # Input 1 exists but the transaction has two outputs, so build a
+        # one-output variant to trigger "nOut out of range".
+        from faketoshi.signing import Transaction
+
+        short = Transaction(tx.version, tx.inputs, tx.outputs[:1], tx.locktime)
         self.assertEqual(
-            tx.sighash_segwit_v0(5, BIP143_1_P2PK_SCRIPTPUBKEY, 1, SIGHASH_SINGLE), 1
+            short.sighash_legacy(1, BIP143_1_P2PK_SCRIPTPUBKEY, SIGHASH_SINGLE), 2 ** 248
         )
+        # Segwit v0 does not have the bug: with a valid input index that has no
+        # matching output, the digest is still a real hash of the transaction.
+        segwit_single = tx.sighash_segwit_v0(1, BIP143_1_P2PK_SCRIPTPUBKEY, 600000000, SIGHASH_SINGLE)
+        self.assertNotEqual(segwit_single, 2 ** 248)
+        self.assertNotEqual(segwit_single, 1)
+
+    def test_out_of_range_input_index_is_rejected(self):
+        tx = parse_transaction(bytes.fromhex(BIP143_1_UNSIGNED))
+        with self.assertRaises(ValueError):
+            tx.sighash_legacy(9, BIP143_1_P2PK_SCRIPTPUBKEY, SIGHASH_ALL)
+        with self.assertRaises(ValueError):
+            tx.sighash_segwit_v0(9, BIP143_1_P2PK_SCRIPTPUBKEY, 1, SIGHASH_ALL)
 
 
 class SignatureTest(unittest.TestCase):
