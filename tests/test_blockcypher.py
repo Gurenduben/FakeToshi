@@ -90,6 +90,19 @@ def make_transport(address_payload=None, push_status=201, push_payload=None, dec
 
 
 class TokenTest(unittest.TestCase):
+    def test_token_env_var_name_is_the_variable_not_a_secret(self):
+        # Guards against a token value being pasted in place of the variable
+        # name: the lookup would then never match, and the secret would be in
+        # the repository.
+        from faketoshi.blockcypher import TOKEN_ENV_VAR
+
+        self.assertEqual(TOKEN_ENV_VAR, 'BLOCKCYPHER_TOKEN')
+        self.assertRegex(TOKEN_ENV_VAR, r'^[A-Z][A-Z0-9_]*$')
+
+    def test_env_token_is_picked_up(self):
+        with mock.patch.dict(os.environ, {'BLOCKCYPHER_TOKEN': 'envtoken'}):
+            self.assertEqual(resolve_token(), 'envtoken')
+
     def test_explicit_token_wins(self):
         self.assertEqual(resolve_token('abc'), 'abc')
 
