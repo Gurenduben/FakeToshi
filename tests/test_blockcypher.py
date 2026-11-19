@@ -273,7 +273,7 @@ class PrevTxTest(unittest.TestCase):
 
 
 class SpendTest(unittest.TestCase):
-    """The guided flow: ask for txid, look up the amount, ask for address."""
+    """The guided flow: ask which coins to spend, then where to send them."""
 
     KEY = int('11' * 32, 16)
     TXID = 'bb' * 32
@@ -281,7 +281,8 @@ class SpendTest(unittest.TestCase):
     def setUp(self):
         from faketoshi.wallet import key_info
 
-        self.address = key_info(self.KEY, 'testnet', 'p2wpkh')[0]
+        self.address, _, pubkey = key_info(self.KEY, 'testnet', 'p2wpkh')
+        self.pubkey = pubkey.hex()
         self.payload = {
             'hash': self.TXID,
             'confirmations': 3,
@@ -334,10 +335,22 @@ class SpendTest(unittest.TestCase):
             rc = main(argv)
         return rc, out.getvalue(), err.getvalue(), out.getvalue(), transport_calls
 
+    def test_asks_for_pubkey_address_then_txid(self):
+        rc, out, _, prompts, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[self.pubkey, self.address, self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('Public key of the address to spend from', out)
+        self.assertIn('Address the coins are held at', out)
+        self.assertIn('Transaction id holding the coins (txid)', out)
+        self.assertIn('public key:  matches your private key', out)
+        self.assertIn('matches your key', out)
+
     def test_asks_for_txid_then_address(self):
         rc, out, _, prompts, _ = self._run(
             ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
-            answers=[self.TXID, self.address, '120000', 'n'],
+            answers=['', '', self.TXID, self.address, '120000', 'n'],
         )
         self.assertEqual(rc, 0)
         self.assertIn('Transaction id holding the coins (txid)', out)
@@ -351,7 +364,7 @@ class SpendTest(unittest.TestCase):
     def test_amount_is_read_from_the_chain(self):
         rc, out, _, _, _ = self._run(
             ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
-            answers=[self.TXID, self.address, '120000', 'n'],
+            answers=['', '', self.TXID, self.address, '120000', 'n'],
         )
         self.assertEqual(rc, 0)
         self.assertIn('Spending 150000 sats (vout 0)', out)
@@ -362,7 +375,7 @@ class SpendTest(unittest.TestCase):
     def test_spent_outputs_are_not_used(self):
         rc, out, _, _, _ = self._run(
             ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
-            answers=[self.TXID, self.address, '120000', 'n'],
+            answers=['', '', self.TXID, self.address, '120000', 'n'],
         )
         self.assertIn('Using vout 0', out)
         self.assertNotIn('output 0: 5000 sats', out)
@@ -370,7 +383,7 @@ class SpendTest(unittest.TestCase):
     def test_over_spend_is_rejected(self):
         rc, _, err, _, _ = self._run(
             ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
-            answers=[self.TXID, self.address, '999999', 'n'],
+            answers=['', '', self.TXID, self.address, '999999', 'n'],
         )
         self.assertEqual(rc, 2)
         self.assertIn('exceeds input', err)
@@ -378,7 +391,7 @@ class SpendTest(unittest.TestCase):
     def test_bad_destination_is_rejected(self):
         rc, _, err, _, _ = self._run(
             ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
-            answers=[self.TXID, 'not-an-address', '1000'],
+            answers=['', '', self.TXID, 'not-an-address', '1000'],
         )
         self.assertEqual(rc, 2)
         self.assertIn('error:', err)
@@ -393,7 +406,7 @@ class SpendTest(unittest.TestCase):
     def test_broadcast_asks_first_and_can_push(self):
         rc, out, _, _, calls = self._run(
             ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
-            answers=[self.TXID, self.address, '120000', 'y'],
+            answers=['', '', self.TXID, self.address, '120000', 'y'],
         )
         self.assertEqual(rc, 0)
         self.assertIn('Broadcast this transaction now?', out)
@@ -422,6 +435,114 @@ class SpendTest(unittest.TestCase):
         rc, _, err, _, _ = self._run(['spend', '--json', '--key', '%064x' % self.KEY])
         self.assertEqual(rc, 2)
         self.assertIn('--txid is required', err)
+
+    def test_wrong_pubkey_is_refused_before_anything_is_signed(self):
+        other = '02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5'
+        rc, out, err, _, calls = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[other],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('does not belong to your private key', err)
+        self.assertIn(self.pubkey, err)
+        self.assertEqual(calls, [], 'must not touch the network')
+
+    def test_malformed_pubkey_is_re_asked(self):
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=['not-a-key', self.pubkey, '', self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('Public key of the address to spend from', out)
+        self.assertIn('check `address --all`', out)
+        self.assertIn('public key:  matches your private key', out)
+
+    def test_uncompressed_pubkey_is_re_asked(self):
+        uncompressed = (
+            '044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa'
+            '385b6b1c8e7fd3f2d1a4a7e4b9f1e8f2a4d4b1c3e9f7a2d8c4b6e1f3a9d7c5b3'
+        )
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[uncompressed, '', '', self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('expected a 33-byte compressed key', out)
+
+    def test_pubkey_is_optional(self):
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=['', '', self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertNotIn('matches your private key', out)
+
+    def test_pubkey_flag_is_checked(self):
+        rc, _, err, _, _ = self._run(
+            [
+                'spend', '--key', '%064x' % self.KEY, '--network', 'testnet',
+                '--pubkey', '02' + '22' * 32,
+            ],
+            answers=[],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('does not belong', err)
+
+    def test_pubkey_flag_skips_the_pubkey_prompt(self):
+        rc, out, _, _, _ = self._run(
+            [
+                'spend', '--key', '%064x' % self.KEY, '--network', 'testnet',
+                '--pubkey', self.pubkey,
+            ],
+            answers=['', self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertNotIn('Public key of the address', out)
+
+    def test_address_prompt_rejects_a_foreign_address(self):
+        rc, _, err, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=['', 'mfWxJ45yp2SFn7UciZyNpvDKrzbhyfKrY8'],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('is not an address this key controls', err)
+
+    def test_segwit_address_switches_kind_automatically(self):
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=['', self.address, self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('switching to --kind p2wpkh', out)
+        self.assertIn('input 0 (p2wpkh)', out)
+
+    def test_explicit_kind_is_not_overridden(self):
+        rc, _, err, _, _ = self._run(
+            [
+                'spend', '--key', '%064x' % self.KEY, '--network', 'testnet',
+                '--kind', 'p2pkh',
+            ],
+            answers=['', self.address],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('pass --kind p2wpkh', err)
+
+    def test_yes_skips_the_guided_questions(self):
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet', '--yes'],
+            answers=[self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertNotIn('Public key of the address', out)
+        self.assertNotIn('Address the coins are held at', out)
+
+    def test_bad_txid_is_re_asked(self):
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=['', '', 'short', self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('a txid is 64 hex characters', out)
 
     def test_json_mode_rejects_already_spent_vout(self):
         rc, _, err, _, _ = self._run(

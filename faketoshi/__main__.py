@@ -282,12 +282,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     spend = subparsers.add_parser(
         'spend',
-        help='guided send: asks for the txid to get r/s/z and the address to send to',
+        help='guided send: asks for the public key, address and txid to spend from',
         description=(
-            'Interactive flow. Asks for the transaction id holding the coins (looked '
-            'up via BlockCypher to get the real amount, which segwit signing needs), '
-            'then the destination address and amount, builds and signs the '
-            'transaction, prints its r/s/z per input, and offers to broadcast.'
+            'Interactive flow. Asks which coins to spend -- the compressed public '
+            'key, the address holding them and the transaction id (looked up via '
+            'BlockCypher to get the real amount, which segwit signing needs) -- then '
+            'the destination address and amount, builds and signs the transaction, '
+            'prints its r/s/z per input, and offers to broadcast.'
         ),
     )
     _add_key_source(spend)
@@ -301,9 +302,10 @@ def build_parser() -> argparse.ArgumentParser:
     spend.add_argument('--change', help='change address (defaults to your own address)')
     spend.add_argument(
         '--kind',
-        default=InputKind.P2PKH,
+        default=None,
         choices=[InputKind.P2PKH, InputKind.P2WPKH],
-        help='script type of the coin being spent (default p2pkh)',
+        help='script type of the coin being spent (default p2pkh, or inferred '
+        'from the address you enter)',
     )
     spend.add_argument(
         '--offline',
@@ -312,12 +314,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     spend.add_argument('--broadcast', action='store_true', help='push it after signing')
     spend.add_argument(
+        '--pubkey',
+        help=(
+            'compressed public key of the address being spent (asked for if '
+            'omitted); checked against your private key'
+        ),
+    )
+    spend.add_argument(
         '--from',
         dest='from_address',
         help=(
             'the address you expect to be spending from; fails fast if it does not '
             'match your key (guards against mixing up compressed/segwit keys)'
         ),
+    )
+    spend.add_argument(
+        '--yes',
+        action='store_true',
+        help='take the defaults for the guided questions instead of asking',
     )
     spend.add_argument('--json', action='store_true', help='non-interactive: print JSON')
 
@@ -909,8 +923,14 @@ def _unspent(args) -> int:
     return 0
 
 
+_STDIN_CLOSED = False
+
+
 def _ask(prompt: str, default: str = '') -> str:
     """Ask a question on a terminal; return ``default`` on empty/EOF input."""
+    global _STDIN_CLOSED
+    if _STDIN_CLOSED:
+        return default
     suffix = ' [%s]' % default if default else ''
     label = '%s%s: ' % (prompt, suffix)
     # Print the question ourselves so it is captured wherever stdout goes.
@@ -918,6 +938,7 @@ def _ask(prompt: str, default: str = '') -> str:
     try:
         answer = input().strip()
     except EOFError:
+        _STDIN_CLOSED = True
         print()
         return default
     return answer or default
@@ -933,10 +954,57 @@ def _ask_int(prompt: str, default: Optional[int] = None) -> Optional[int]:
         except ValueError:
             print('  please enter a whole number (satoshis)')
 
+def _ask_public_key(prompt: str = 'Public key of the address to spend from') -> Optional[str]:
+    """Ask for a compressed public key, re-prompting until it parses.
+
+    Returns the normalised hex, or ``None`` if the user leaves it blank (they
+    may simply not have it to hand -- the key is only used to double-check the
+    address).
+    """
+    while True:
+        text = _ask(prompt + ' (blank to skip)')
+        text = text.strip()
+        if not text or _STDIN_CLOSED:
+            return None
+        if text[:2].lower() == '0x':
+            text = text[2:]
+        try:
+            raw = bytes.fromhex(text)
+            if len(raw) in (35, 67) and raw[0] in (0x21, 0x41):
+                raw = raw[1:-1]  # unwrap a P2PK script
+            if len(raw) != 33:
+                raise ValueError(
+                    'expected a 33-byte compressed key (02/03...), got %d bytes'
+                    % len(raw)
+                )
+            decode_point(raw)
+        except ValueError as exc:
+            print('  %s' % exc)
+            print('  check `address --all` for the public key of your key')
+            continue
+        return raw.hex()
+
+
+def _ask_address(prompt: str = 'Address the coins are held at', default: str = '') -> str:
+    """Ask for an address; empty input accepts ``default``."""
+    while True:
+        text = _ask(prompt, default)
+        text = text.strip()
+        if text:
+            return text
+        if _STDIN_CLOSED or default:
+            return default
+        print('  an address is required')
+
 
 def _spend(args) -> int:
     interactive = not args.json
     network = args.network
+    # --kind is optional: if the user did not pin it, the address they enter
+    # decides between p2pkh and p2wpkh.
+    args.kind_explicit = args.kind is not None
+    if args.kind is None:
+        args.kind = InputKind.P2PKH
 
     try:
         private_key = resolve_private_key(args.wif, args.key)
@@ -947,11 +1015,56 @@ def _spend(args) -> int:
     # --- 0. make sure the user knows which address they are spending from ----
     if interactive:
         print('key format:  compressed (%d-byte public key)' % len(pubkey))
-    if args.from_address:
+        print('your address: %s' % address)
+
+    # In guided mode ask which coins to spend, up front: the public key, the
+    # address holding them, and (below) the transaction id.
+    from_address = args.from_address
+
+    def _check_pubkey(supplied: str) -> Optional[int]:
+        """None when ``supplied`` is our key, else a failure exit code."""
+        text = (supplied or '').strip().lower()
+        if text[:2] == '0x':
+            text = text[2:]
+        if text == pubkey.hex():
+            return None
+        return _fail(
+            ValueError(
+                'that public key does not belong to your private key.\n'
+                'your public key: %s\n'
+                'run `address --all` to see every address this key controls'
+                % pubkey.hex()
+            )
+        )
+
+    if args.pubkey:
+        failure = _check_pubkey(args.pubkey)
+        if failure is not None:
+            return failure
+        if interactive:
+            print('public key:  matches your private key')
+
+    if interactive and not args.yes and (not args.pubkey or not from_address):
+        print()
+        print(
+            'Tell me which coins to spend. Press Enter to accept the default '
+            'shown in [brackets].'
+        )
+        if not args.pubkey:
+            answered = _ask_public_key()  # blank means "don't check"
+            if answered:
+                failure = _check_pubkey(answered)
+                if failure is not None:
+                    return failure
+                print('public key:  matches your private key')
+        if not from_address:
+            from_address = _ask_address('Address the coins are held at', address)
+
+    if from_address:
         from .encoding import hash160
         from .wallet import address_types
 
-        expected = (args.from_address or '').strip()
+        expected = (from_address or '').strip()
         supported = address_types(pubkey, network)
         match = [name for name, (value, _) in supported.items() if value == expected]
         if not match:
@@ -982,12 +1095,29 @@ def _spend(args) -> int:
                 )
             )
         if match[0] != args.kind:
-            return _fail(
-                ValueError(
-                    'that address is %s but --kind is %s; pass --kind %s to spend it'
-                    % (match[0], args.kind, match[0])
+            # The address tells us the script type; follow it when the address
+            # came from an interactive answer rather than an explicit flag.
+            if args.kind_explicit:
+                return _fail(
+                    ValueError(
+                        'that address is %s but --kind is %s; pass --kind %s to spend it'
+                        % (match[0], args.kind, match[0])
+                    )
                 )
-            )
+            if match[0] == InputKind.P2WPKH:
+                if interactive:
+                    print(
+                        '  %s is a segwit address, so switching to --kind p2wpkh'
+                        % expected
+                    )
+                args.kind = InputKind.P2WPKH
+            else:
+                return _fail(
+                    ValueError(
+                        'that address is %s but --kind is %s; pass --kind %s to spend it'
+                        % (match[0], args.kind, match[0])
+                    )
+                )
         if interactive:
             print('spending from: %s (%s) - matches your key' % (expected, match[0]))
 
@@ -998,7 +1128,16 @@ def _spend(args) -> int:
     if not txid:
         if not interactive:
             return _fail(ValueError('--txid is required with --json'))
-        txid = _ask('Transaction id holding the coins (txid)')
+        while True:
+            txid = _ask('Transaction id holding the coins (txid)')
+            txid = (txid or '').strip().lower()
+            if txid[:2] == '0x':
+                txid = txid[2:]
+            if len(txid) == 64:
+                break
+            print('  a txid is 64 hex characters (got %d)' % len(txid))
+            if _STDIN_CLOSED:
+                return _fail(ValueError('txid must be 64 hex characters'))
     txid = (txid or '').strip()
     if len(txid) != 64:
         return _fail(ValueError('txid must be 64 hex characters'))
@@ -1230,6 +1369,8 @@ _HANDLERS = {
 
 
 def main(argv=None) -> int:
+    global _STDIN_CLOSED
+    _STDIN_CLOSED = False  # each invocation gets a fresh chance to read input
     args = build_parser().parse_args(argv)
     if args.command == 'verify':
         return _verify(args)

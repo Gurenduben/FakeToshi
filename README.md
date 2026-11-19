@@ -145,11 +145,16 @@ signing with: p2pkh
 `--json` gives the same thing machine-readably (`{"network", "public_key",
 "compressed", "addresses": {kind: {"address", "note"}}}`).
 
-To *assert* which address you are spending from, pass `--from` to `spend`:
+`spend` asks for the address (and the public key) interactively, so you can
+confirm what you are spending from as you go. To pin it non-interactively, pass
+`--from` (and optionally `--pubkey`):
 
 ```
-$ python -m faketoshi spend --key <hex> --from 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
-key format:  compressed (33-byte public key)
+$ python -m faketoshi spend --key <hex>
+...
+Public key of the address to spend from (blank to skip): 034f355b...71aa
+public key:  matches your private key
+Address the coins are held at [1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9]: 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
 spending from: 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9 (p2pkh) - matches your key
 ...
 ```
@@ -339,11 +344,20 @@ cryptography is this repository's own, checked against the vectors above.
 ### Guided send: `spend`
 
 The quickest path from "I have coins in a transaction" to a signed, spendable
-transaction. It asks for the two things you know — the **transaction id** and
-the **address to send to** — and works out the rest:
+transaction. It asks which coins you are spending — the **public key**, the
+**address** holding them and the **transaction id** — then where to send them,
+and works out the rest:
 
 ```
 $ python -m faketoshi spend --key <hex>
+key format:  compressed (33-byte public key)
+your address: 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
+
+Tell me which coins to spend. Press Enter to accept the default shown in [brackets].
+Public key of the address to spend from (blank to skip): 034f355bdcb7cc0a...71aa
+public key:  matches your private key
+Address the coins are held at [1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9]:
+spending from: 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9 (p2pkh) - matches your key
 You are spending from 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9 (your address for this key)
 Transaction id holding the coins (txid): bbbbbb...bbbb
 
@@ -377,6 +391,16 @@ the value of the coin being spent (BIP143), so the amount must come from the
 chain. `spend` looks the transaction up via BlockCypher, lists its **unspent**
 outputs (skipping ones with a `spent_by`), and uses the real value.
 
+- The first three questions are all optional: press Enter to skip the public
+  key (it is only a cross-check) or to accept the suggested address. Each answer
+  can also be given up front with `--pubkey`, `--from` and `--txid`.
+- A **wrong** public key stops immediately, before any chain lookup or signing,
+  and shows the key that actually belongs to your private key. Malformed input
+  re-prompts instead of aborting.
+- If you paste a **segwit** address, the script type switches to `p2wpkh`
+  automatically. Pass `--kind` explicitly and your choice is respected instead.
+- `--yes` takes the defaults for the guided questions, for when you already
+  know exactly what you are spending.
 - Change goes back to your own address unless you pass `--change`.
 - Outputs and amounts are validated: over-spending is refused with a clear
   message, and the destination address is checksum-verified (a typo is caught
