@@ -261,6 +261,65 @@ Bitcoin. Its notebook only shells out to a prebuilt binary downloaded from a
 third-party site. Nothing here executes that binary or relies on it; all the
 cryptography is this repository's own, checked against the vectors above.
 
+### Guided send: `spend`
+
+The quickest path from "I have coins in a transaction" to a signed, spendable
+transaction. It asks for the two things you know — the **transaction id** and
+the **address to send to** — and works out the rest:
+
+```
+$ python -m faketoshi spend --key <hex> --network testnet
+You are spending from tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8 (your address for this key)
+Transaction id holding the coins (txid): bbbbbb...bbbb
+
+Outputs of bbbbbb...bbbb:
+  vout 0: 150000 sats -> tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8
+  vout 1: 5000 sats -> tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8  (spent by cccc...)
+Using vout 0
+Spending 150000 sats (vout 0)
+Address to send to: tb1q8yxdhnczfvps8j2tr238dqrk7tu5s4fx40wmw2
+Amount to send in satoshis (max 149000) [149000]: 120000
+
+network:   testnet
+txid:   671defe7b48b6e4338eeb01ee3e5998c4f55a0a5623ac01fb603b5876e790771
+output 0: 120000 sats -> tb1q8yxdhnczfvps8j2tr238dqrk7tu5s4fx40wmw2
+output 1: 29000 sats -> tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8
+fee:       1000 sats
+
+input 0 (p2wpkh)
+  r: 13833665704091852410380424202317488631917989966809020605154961286015434317443
+  s: 12412599491612096321021231994955708688771632628716482483936922106243143072732
+  z: 26694242829220974310791855546522354592590164048673495937700179924798489494256
+  sighash type: 0x01
+  signature: 304402201e9593cb...
+
+raw transaction: 02000000000101bbbb...
+Broadcast this transaction now? (y/N) [n]:
+```
+
+Why it asks for the txid rather than a raw amount: segwit signatures commit to
+the value of the coin being spent (BIP143), so the amount must come from the
+chain. `spend` looks the transaction up via BlockCypher, lists its **unspent**
+outputs (skipping ones with a `spent_by`), and uses the real value.
+
+- Change goes back to your own address unless you pass `--change`.
+- Outputs and amounts are validated: over-spending is refused with a clear
+  message, and the destination address is checksum-verified (a typo is caught
+  before you sign anything).
+- Nothing is broadcast without an explicit `y`; decline and the signed hex is
+  printed for you to send yourself.
+- Fully scriptable too:
+
+```
+python -m faketoshi spend --json --key <hex> --network testnet \
+    --txid <txid> --address <addr> --amount 120000 [--broadcast]
+```
+
+`--json` prints only JSON (no prompts), requires `--txid`/`--address`/`--amount`,
+and infers `--vout` when the transaction has exactly one unspent output.
+`--offline` skips the chain lookup when you already know the input amount.
+`--fee` sets the fee in satoshis (default 1000).
+
 ### Live UTXOs and broadcasting (BlockCypher)
 
 `unspent` lists real unspent outputs, ready to paste into `--input`:

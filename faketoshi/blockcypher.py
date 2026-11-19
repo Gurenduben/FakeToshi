@@ -75,6 +75,41 @@ class Utxo:
 
 
 @dataclass(frozen=True)
+class TxOutput:
+    """One output of a previous transaction, as an input candidate."""
+
+    index: int
+    value: int
+    addresses: tuple = ()
+    script: bytes = b''
+    spent_by: str = ''
+
+    @property
+    def address(self) -> str:
+        return self.addresses[0] if self.addresses else ''
+
+    def __str__(self) -> str:
+        return 'vout %d: %d sats -> %s%s' % (
+            self.index,
+            self.value,
+            self.address or self.script.hex(),
+            '  (spent by %s)' % self.spent_by[:16] if self.spent_by else '',
+        )
+
+
+@dataclass(frozen=True)
+class PrevTx:
+    """A previous transaction's hash and outputs (for picking an input)."""
+
+    tx_hash: str
+    outputs: List[TxOutput]
+    confirmations: int = 0
+
+    def unspent(self) -> List[TxOutput]:
+        return [o for o in self.outputs if not o.spent_by]
+
+
+@dataclass(frozen=True)
 class BroadcastResult:
     tx_hash: str
     raw: Dict
@@ -188,6 +223,46 @@ class BlockCypherClient:
 
     def balance(self, address: str) -> Dict:
         return self._request('GET', 'addrs/%s/balance' % address)
+
+    def transaction(self, tx_hash: str) -> Dict:
+        return self._request('GET', 'txs/%s' % tx_hash)
+
+    def previous_transaction(self, tx_hash: str) -> PrevTx:
+        """Look up a transaction so one of its outputs can be spent."""
+        text = tx_hash.strip()
+        if text[:2].lower() == '0x':
+            text = text[2:]
+        if len(text) != 64:
+            raise ValueError('txid must be 64 hex characters')
+        try:
+            bytes.fromhex(text)
+        except ValueError:
+            raise ValueError('txid is not valid hex') from None
+
+        data = self.transaction(text)
+        outputs: List[TxOutput] = []
+        for index, entry in enumerate(data.get('outputs') or []):
+            script_hex = entry.get('script') or ''
+            try:
+                script = bytes.fromhex(script_hex) if script_hex else b''
+            except ValueError:
+                script = b''
+            outputs.append(
+                TxOutput(
+                    index=int(entry.get('output_index', index)),
+                    value=int(entry.get('value') or 0),
+                    addresses=tuple(entry.get('addresses') or ()),
+                    script=script,
+                    spent_by=entry.get('spent_by') or '',
+                )
+            )
+        if not outputs:
+            raise BlockCypherError('transaction %s has no outputs' % text)
+        return PrevTx(
+            tx_hash=data.get('hash', text),
+            outputs=outputs,
+            confirmations=int(data.get('confirmations') or 0),
+        )
 
     def unspent_outputs(self, address: str, include_unconfirmed: bool = True) -> List[Utxo]:
         """Unspent outputs of ``address`` as :class:`Utxo` objects."""

@@ -220,6 +220,211 @@ class PushTest(unittest.TestCase):
         self.assertEqual(client.decode(BIP143_1_SIGNED), {'hash': 'a' * 64})
 
 
+class PrevTxTest(unittest.TestCase):
+    def test_previous_transaction_parses_outputs(self):
+        client = BlockCypherClient(token='t', transport=make_transport())
+        payload = {
+            'hash': 'ab' * 32,
+            'confirmations': 7,
+            'outputs': [
+                {
+                    'output_index': 0,
+                    'value': 677200,
+                    'addresses': ['32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe'],
+                    'script': 'a91406612b7cb2027e80ec340f9e02ffe4a9a59ba76287',
+                },
+                {'output_index': 1, 'value': 900, 'addresses': [], 'spent_by': 'cd' * 32},
+            ],
+        }
+        client._transport = lambda m, u, b: (200, json.dumps(payload))
+        prev = client.previous_transaction('ab' * 32)
+        self.assertEqual(prev.tx_hash, 'ab' * 32)
+        self.assertEqual(prev.confirmations, 7)
+        self.assertEqual(prev.outputs[0].value, 677200)
+        self.assertEqual(prev.outputs[0].address, '32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe')
+        self.assertEqual(prev.outputs[1].spent_by, 'cd' * 32)
+        self.assertEqual([o.index for o in prev.unspent()], [0])
+
+    def test_bad_txid_is_rejected_before_any_request(self):
+        calls = []
+        client = BlockCypherClient(token='t', transport=lambda m, u, b: calls.append(u) or (200, '{}'))
+        for bad in ('', 'abc', 'z' * 64, 'ab' * 31):
+            with self.assertRaises(ValueError):
+                client.previous_transaction(bad)
+        self.assertEqual(calls, [])
+
+    def test_no_outputs_is_an_error(self):
+        client = BlockCypherClient(token='t', transport=lambda m, u, b: (200, json.dumps({'outputs': []})))
+        with self.assertRaises(BlockCypherError):
+            client.previous_transaction('ab' * 32)
+
+
+class SpendTest(unittest.TestCase):
+    """The guided flow: ask for txid, look up the amount, ask for address."""
+
+    KEY = int('11' * 32, 16)
+    TXID = 'bb' * 32
+
+    def setUp(self):
+        from faketoshi.wallet import key_info
+
+        self.address = key_info(self.KEY, 'testnet')[0]
+        self.payload = {
+            'hash': self.TXID,
+            'confirmations': 3,
+            'outputs': [
+                {
+                    'output_index': 0,
+                    'value': 150000,
+                    'addresses': [self.address],
+                    'script': '0014fc7250a211deddc70ee5a2738de5f07817351cef',
+                },
+                {
+                    'output_index': 1,
+                    'value': 5000,
+                    'addresses': [self.address],
+                    'script': '0014fc7250a211deddc70ee5a2738de5f07817351cef',
+                    'spent_by': 'cc' * 32,
+                },
+            ],
+        }
+
+    def _run(self, argv, answers=()):
+        import contextlib
+        import io
+
+        from faketoshi.__main__ import main
+
+        seen = []
+        transport_calls = []
+
+        def transport(method, url, body):
+            transport_calls.append((method, url, body))
+            if 'txs/push' in url:
+                return 201, json.dumps({'tx': {'hash': 'dd' * 32}})
+            return 200, json.dumps(self.payload)
+
+        client_factory = lambda args: BlockCypherClient(
+            token='t', network=args.network, transport=transport
+        )
+        queue = list(answers)
+
+        def fake_input(prompt=''):
+            if not queue:
+                raise EOFError
+            return queue.pop(0)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch('faketoshi.__main__._client', client_factory), mock.patch(
+            'builtins.input', fake_input
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue(), out.getvalue(), transport_calls
+
+    def test_asks_for_txid_then_address(self):
+        rc, out, _, prompts, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('Transaction id holding the coins (txid)', out)
+        self.assertIn('Address to send to', out)
+        self.assertIn('input 0 (p2wpkh)', out)
+        self.assertIn('  r: ', out)
+        self.assertIn('  s: ', out)
+        self.assertIn('  z: ', out)
+        self.assertIn('Not broadcast', out)
+
+    def test_amount_is_read_from_the_chain(self):
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('Spending 150000 sats (vout 0)', out)
+        # 150000 in, 120000 out, 1000 fee -> 29000 change
+        self.assertIn('fee:       1000 sats', out)
+        self.assertIn('output 1: 29000 sats', out)
+
+    def test_spent_outputs_are_not_used(self):
+        rc, out, _, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[self.TXID, self.address, '120000', 'n'],
+        )
+        self.assertIn('Using vout 0', out)
+        self.assertNotIn('output 0: 5000 sats', out)
+
+    def test_over_spend_is_rejected(self):
+        rc, _, err, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[self.TXID, self.address, '999999', 'n'],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('exceeds input', err)
+
+    def test_bad_destination_is_rejected(self):
+        rc, _, err, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[self.TXID, 'not-an-address', '1000'],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('error:', err)
+
+    def test_bad_txid_is_rejected(self):
+        rc, _, err, _, _ = self._run(
+            ['spend', '--key', '%064x' % self.KEY], answers=['short', self.address, '1000']
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('64 hex', err)
+
+    def test_broadcast_asks_first_and_can_push(self):
+        rc, out, _, _, calls = self._run(
+            ['spend', '--key', '%064x' % self.KEY, '--network', 'testnet'],
+            answers=[self.TXID, self.address, '120000', 'y'],
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn('Broadcast this transaction now?', out)
+        self.assertTrue(any('txs/push' in c[1] for c in calls))
+
+    def test_json_mode_is_non_interactive(self):
+        rc, out, _, prompts, _ = self._run(
+            [
+                'spend', '--json',
+                '--key', '%064x' % self.KEY,
+                '--network', 'testnet',
+                '--txid', self.TXID,
+                '--address', self.address,
+                '--amount', '120000',
+            ]
+        )
+        self.assertEqual(rc, 0)
+        # --json mode prints only JSON: no prompts, no report text
+        json.loads(out)
+        payload = json.loads(out)
+        self.assertEqual(payload['fee'], 1000)
+        self.assertEqual(len(payload['signatures']), 1)
+        self.assertTrue(payload['signatures'][0]['r'])
+
+    def test_json_mode_requires_arguments(self):
+        rc, _, err, _, _ = self._run(['spend', '--json', '--key', '%064x' % self.KEY])
+        self.assertEqual(rc, 2)
+        self.assertIn('--txid is required', err)
+
+    def test_json_mode_rejects_already_spent_vout(self):
+        rc, _, err, _, _ = self._run(
+            [
+                'spend', '--json',
+                '--key', '%064x' % self.KEY,
+                '--txid', self.TXID,
+                '--vout', '1',
+                '--address', self.address,
+                '--amount', '1000',
+            ]
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('already spent', err)
+
+
 class CliTest(unittest.TestCase):
     def _run(self, argv, stdin_text=None):
         import contextlib
