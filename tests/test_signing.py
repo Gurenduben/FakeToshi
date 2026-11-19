@@ -223,6 +223,53 @@ class SighashTest(unittest.TestCase):
             tx.sighash_segwit_v0(9, BIP143_1_P2PK_SCRIPTPUBKEY, 1, SIGHASH_ALL)
 
 
+class DefaultsTest(unittest.TestCase):
+    """mainnet + P2PKH are the defaults, everywhere."""
+
+    KEY = int('11' * 32, 16)
+
+    def test_key_info_defaults_to_mainnet_p2pkh(self):
+        address, wif, pubkey = key_info(self.KEY)
+        self.assertEqual(address, p2pkh_address(private_key_to_public_key(self.KEY), 'mainnet'))
+        self.assertTrue(address.startswith('1'))
+        # mainnet WIF starts with K or L
+        self.assertIn(wif[0], 'KL')
+
+    def test_build_transaction_defaults_to_mainnet_p2pkh(self):
+        address = key_info(self.KEY)[0]
+        built = build_transaction(
+            ['aa' * 32 + ':0:100000'], [address + ':90000'], self.KEY
+        )
+        self.assertEqual(built.network, 'mainnet')
+        self.assertEqual(built.signatures[0].kind, 'p2pkh')
+        self.assertFalse(built.transaction.is_segwit())
+        self.assertTrue(built.address.startswith('1'))
+        # legacy signatures really verify against the key
+        self.assertTrue(
+            verify_z(decode_point(bytes.fromhex(built.pubkey_hex)),
+                     built.signatures[0].r, built.signatures[0].s, built.signatures[0].z)
+        )
+
+    def test_network_and_kind_can_still_be_chosen(self):
+        self.assertTrue(key_info(self.KEY, 'testnet')[0].startswith(('m', 'n')))
+        self.assertTrue(key_info(self.KEY, 'mainnet', 'p2wpkh')[0].startswith('bc1'))
+        self.assertTrue(key_info(self.KEY, 'testnet', 'p2wpkh')[0].startswith('tb1'))
+
+    def test_make_unsigned_defaults_to_mainnet(self):
+        address = key_info(self.KEY)[0]
+        tx = make_unsigned(['aa' * 32 + ':0:1000'], [address + ':900'])
+        self.assertEqual(len(tx.inputs), 1)
+
+    def test_cli_rejects_address_for_another_network(self):
+        # A testnet address with the mainnet default must fail, not silently work.
+        with self.assertRaises(ValueError):
+            build_transaction(
+                ['aa' * 32 + ':0:1000'],
+                [p2pkh_address(private_key_to_public_key(self.KEY), 'testnet') + ':900'],
+                self.KEY,
+            )
+
+
 class SignatureTest(unittest.TestCase):
     def test_rfc6979_is_deterministic(self):
         first = sign_z(BIP143_1_KEY, 12345)
@@ -304,8 +351,15 @@ class WalletTest(unittest.TestCase):
     ADDRESS = 'tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8'
 
     def test_key_info(self):
-        address, wif, pubkey = key_info(self.KEY, 'testnet')
-        self.assertEqual(address, self.ADDRESS)
+        # default is now P2PKH (base58) with mainnet
+        address, wif, pubkey = key_info(self.KEY)
+        self.assertTrue(address.startswith('1'))
+        self.assertEqual(
+            address, p2pkh_address(private_key_to_public_key(self.KEY), 'mainnet')
+        )
+        # opt-in to segwit where wanted
+        segwit, _, _ = key_info(self.KEY, 'testnet', 'p2wpkh')
+        self.assertEqual(segwit, self.ADDRESS)
         self.assertEqual(
             pubkey.hex(), '034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa'
         )
@@ -347,13 +401,13 @@ class WalletTest(unittest.TestCase):
             build_transaction(['aa' * 32 + ':0'], [self.ADDRESS + ':90000'], self.KEY)
 
     def test_unsigned_then_signraw_matches_tx(self):
-        unsigned = make_unsigned(
-            ['aa' * 32 + ':0:100000'], [self.ADDRESS + ':90000'], network='testnet'
-        )
+        # Both paths now default to P2PKH, so they must agree exactly.
+        address = key_info(self.KEY, 'mainnet', 'p2pkh')[0]
+        unsigned = make_unsigned(['aa' * 32 + ':0:100000'], [address + ':90000'])
         direct = build_transaction(
-            ['aa' * 32 + ':0:100000'], [self.ADDRESS + ':90000'], self.KEY, network='testnet'
+            ['aa' * 32 + ':0:100000'], [address + ':90000'], self.KEY
         )
-        script = address_to_script(self.ADDRESS, 'testnet')
+        script = address_to_script(address, 'mainnet')
         signed = sign_raw_transaction(unsigned.hex(), self.KEY, [(script, 100000)])
         self.assertEqual(signed.txid, direct.txid)
 
@@ -395,7 +449,8 @@ class SigningCliTest(unittest.TestCase):
         rc, out, _ = self._run(['keygen', '--network', 'testnet', '--json'])
         self.assertEqual(rc, 0)
         payload = json.loads(out)
-        self.assertTrue(payload['address'].startswith('tb1q'))
+        # P2PKH is the default now, so testnet addresses start with m or n
+        self.assertIn(payload['address'][0], 'mn')
         self.assertTrue(payload['wif'].startswith('c'))
         self.assertEqual(len(payload['private_key']), 64)
 
@@ -403,7 +458,7 @@ class SigningCliTest(unittest.TestCase):
         wif = private_key_to_wif(self.KEY, 'testnet')
         rc, out, _ = self._run(['address', '--wif', wif, '--network', 'testnet'])
         self.assertEqual(rc, 0)
-        self.assertIn('tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8', out)
+        self.assertIn(p2pkh_address(private_key_to_public_key(self.KEY), 'testnet'), out)
 
     def test_sign_then_verify_round_trip(self):
         import json

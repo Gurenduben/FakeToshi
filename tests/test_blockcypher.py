@@ -281,7 +281,7 @@ class SpendTest(unittest.TestCase):
     def setUp(self):
         from faketoshi.wallet import key_info
 
-        self.address = key_info(self.KEY, 'testnet')[0]
+        self.address = key_info(self.KEY, 'testnet', 'p2wpkh')[0]
         self.payload = {
             'hash': self.TXID,
             'confirmations': 3,
@@ -342,7 +342,7 @@ class SpendTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn('Transaction id holding the coins (txid)', out)
         self.assertIn('Address to send to', out)
-        self.assertIn('input 0 (p2wpkh)', out)
+        self.assertIn('input 0 (p2pkh)', out)
         self.assertIn('  r: ', out)
         self.assertIn('  s: ', out)
         self.assertIn('  z: ', out)

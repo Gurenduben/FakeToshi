@@ -28,10 +28,10 @@ python -m faketoshi --x <hex> --y <hex>   # any other Satoshi pubkey
 python -m faketoshi verify --txid <64-hex-txid> --r <hex> --s <hex>
 
 # Your own key: r/s/z for a hash, and real signed transactions
-python -m faketoshi keygen --network testnet
-python -m faketoshi address --wif <wif> --network testnet
+python -m faketoshi keygen
+python -m faketoshi address --wif <wif>
 python -m faketoshi sign --key <hex> --txid <64-hex>
-python -m faketoshi tx --key <hex> --network testnet \
+python -m faketoshi tx --key <hex> \
     --input <TXID>:<VOUT>:<AMOUNT_SATS> --output <ADDRESS>:<SATS>
 python -m faketoshi unsigned --input ... --output ...   # then:
 python -m faketoshi signraw --key <hex> --raw <txhex> --prevout <SCRIPT>:<AMOUNT>
@@ -126,12 +126,12 @@ control.
 What does work, and is what this tool now does:
 
 ```
-$ python -m faketoshi keygen --network testnet
+$ python -m faketoshi keygen
 network:     testnet
 private_key: 41192f4f30bdb35a94c4f2c3b6d9e5ad9f70edc8f06a786e110da070aaa8495a
 wif:         cPmF8MHddMc8nHEwxGSGGyH3Ffdptvf6jkrF3ZaVxBWpFQG4ptWB
 public_key:  03cd26fcd4836fbec4b6017ac3775b8719a0f239dc52d7e7dbd4ec7e8b005d21a3
-address:     tb1qxm6r2en8qua3eyzhry5lca2k7tagpgzdnf48xh
+address:     1FyqU8e5cLwG2rVh3sT2bN9kQ7mZ4pX1aB
 
 $ python -m faketoshi sign --key 41192f... --txid <64-hex hash>
 r:            41394527160349269893567719044975991464542403203770718342843697060277985947166
@@ -145,15 +145,15 @@ Build a real, broadcastable transaction and see the `r`/`s`/`z` of every input
 signature:
 
 ```
-$ python -m faketoshi tx --key <hex> --network testnet \
-      --input <TXID>:0:100000 --output tb1q...:90000
-network:   testnet
-address:   tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8
+$ python -m faketoshi tx --key <hex> \
+      --input <TXID>:0:100000 --output 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9:90000
+network:   mainnet
+address:   1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
 ...
 txid:   2ad83856c35e86d6e2f9ee2d2e7f9218b32a337a7b216c579a411327c3fdfc58
 wtxid:  2fa3a5dd7ba68e8dcdb73e52a2b00a722e6bedea45bcbe8bbbdca81d6f8e7130
 input 0: aaaaaaaa...:0 sequence=0xffffffff
-output 0: 90000 sats -> tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8
+output 0: 90000 sats -> 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
 fee:      10000 sats
 
 input 0 (p2wpkh)
@@ -174,7 +174,7 @@ Details that matter:
 - Signing is **RFC 6979 deterministic**: the same key and transaction always
   give the same signature, so you can re-run and compare. `s` is low-s
   normalised, as consensus/policy requires.
-- Supported spend types: **P2WPKH** (default), **P2PKH**, and P2SH-P2WPKH via
+- Supported spend types: **P2PKH** (default), **P2WPKH**, and P2SH-P2WPKH via
   the library (`sign_transaction_kinds`). Taproot (Schnorr) is *not* supported.
 - `--sighash` accepts `1` (ALL), `2` (NONE), `3` (SINGLE), `+0x80` for
   ANYONECANPAY; the legacy and BIP143 rules are both implemented, including the
@@ -269,25 +269,25 @@ transaction. It asks for the two things you know — the **transaction id** and
 the **address to send to** — and works out the rest:
 
 ```
-$ python -m faketoshi spend --key <hex> --network testnet
-You are spending from tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8 (your address for this key)
+$ python -m faketoshi spend --key <hex>
+You are spending from 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9 (your address for this key)
 Transaction id holding the coins (txid): bbbbbb...bbbb
 
 Outputs of bbbbbb...bbbb:
-  vout 0: 150000 sats -> tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8
-  vout 1: 5000 sats -> tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8  (spent by cccc...)
+  vout 0: 150000 sats -> 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
+  vout 1: 5000 sats -> 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9  (spent by cccc...)
 Using vout 0
 Spending 150000 sats (vout 0)
-Address to send to: tb1q8yxdhnczfvps8j2tr238dqrk7tu5s4fx40wmw2
+Address to send to: 1LhsLSUhjKiBWC3NTLZ7LeXPAdXXnDDg9c
 Amount to send in satoshis (max 149000) [149000]: 120000
 
 network:   testnet
 txid:   671defe7b48b6e4338eeb01ee3e5998c4f55a0a5623ac01fb603b5876e790771
-output 0: 120000 sats -> tb1q8yxdhnczfvps8j2tr238dqrk7tu5s4fx40wmw2
-output 1: 29000 sats -> tb1ql3e9pgs3mmwuwrh95fecme0s0qtn28804khrk8
+output 0: 120000 sats -> 1LhsLSUhjKiBWC3NTLZ7LeXPAdXXnDDg9c
+output 1: 29000 sats -> 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
 fee:       1000 sats
 
-input 0 (p2wpkh)
+input 0 (p2pkh)
   r: 13833665704091852410380424202317488631917989966809020605154961286015434317443
   s: 12412599491612096321021231994955708688771632628716482483936922106243143072732
   z: 26694242829220974310791855546522354592590164048673495937700179924798489494256
@@ -312,7 +312,7 @@ outputs (skipping ones with a `spent_by`), and uses the real value.
 - Fully scriptable too:
 
 ```
-python -m faketoshi spend --json --key <hex> --network testnet \
+python -m faketoshi spend --json --key <hex> \
     --txid <txid> --address <addr> --amount 120000 [--broadcast]
 ```
 
@@ -328,6 +328,7 @@ and infers `--vout` when the transaction has exactly one unspent output.
 ```
 $ export BLOCKCYPHER_TOKEN=...                     # only if you have one
 $ python -m faketoshi unspent 32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe --input-specs
+# add --network testnet for testnet addresses
 7e3c...e21:0:677200
 9a10...ff4:1:5000000
 ```
@@ -335,10 +336,10 @@ $ python -m faketoshi unspent 32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe --input-specs
 and `broadcast` pushes a signed transaction:
 
 ```
-$ python -m faketoshi tx --key <hex> --network testnet \
+$ python -m faketoshi tx --key <hex> \
       --input <utxo-spec> --output <address>:<sats> --json | jq -r .hex > tx.hex
-$ python -m faketoshi broadcast - --network testnet < tx.hex
-network:  testnet
+$ python -m faketoshi broadcast - < tx.hex
+network:  mainnet
 txid:     2ad83856c35e86d6e2f9ee2d2e7f9218b32a337a7b216c579a411327c3fdfc58
 size:     191 bytes
 output 0: 90000 sats

@@ -247,7 +247,7 @@ class LauncherTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as elsewhere:
             result = subprocess.run(
-                [sys.executable, self.launcher, 'keygen', '--network', 'testnet', '--json'],
+                [sys.executable, self.launcher, 'keygen', '--json'],
                 cwd=elsewhere,
                 capture_output=True,
                 text=True,

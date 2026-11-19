@@ -189,14 +189,27 @@ def resolve_private_key(wif: Optional[str] = None, key: Optional[str] = None) ->
     return generate_private_key()
 
 
-def key_info(private_key: int, network: str = 'mainnet') -> Tuple[str, str, bytes]:
-    """Return ``(address, wif, pubkey_bytes)`` for a private key."""
+def key_info(
+    private_key: int,
+    network: str = 'mainnet',
+    kind: str = InputKind.P2PKH,
+) -> Tuple[str, str, bytes]:
+    """Return ``(address, wif, pubkey_bytes)`` for a private key.
+
+    ``kind`` selects the address type and defaults to P2PKH (legacy, base58),
+    matching the default script type this tool signs.  Pass ``p2wpkh`` for a
+    bech32 address instead.  Keeping the two in step matters: change is paid to
+    this address, so a bech32 default with a P2PKH spend would mix script types
+    for no reason.
+    """
     pubkey = private_key_to_public_key(private_key)
-    return (
-        p2wpkh_address(pubkey, network),
-        private_key_to_wif(private_key, network),
-        pubkey,
-    )
+    if kind == InputKind.P2WPKH:
+        address = p2wpkh_address(pubkey, network)
+    elif kind == InputKind.P2PKH:
+        address = p2pkh_address(pubkey, network)
+    else:
+        raise ValueError('unsupported address kind %r' % (kind,))
+    return address, private_key_to_wif(private_key, network), pubkey
 
 
 # ---------------------------------------------------------------------------
@@ -254,16 +267,17 @@ def build_transaction(
     inputs: Sequence[str],
     outputs: Sequence[str],
     private_key: int,
-    network: str = 'testnet',
+    network: str = 'mainnet',
     kind: Optional[str] = None,
     sighash_type: int = 0x01,
     version: int = 2,
     locktime: int = 0,
     regtest: bool = False,
 ) -> BuiltTransaction:
-    """Build and sign a transaction spending P2WPKH coins.
+    """Build and sign a transaction spending P2PKH coins by default.
 
-    ``kind`` forces the script type; by default it is P2WPKH.  With
+    ``kind`` selects the script type (P2PKH unless overridden, P2WPKH for
+    segwit coins).  With
     ``regtest=True`` the single input's previous output is assumed to be the
     regtest coinbase from :data:`REGTEST_COINBASE_SCRIPT`, which is handy for
     experiments without a real chain.
@@ -289,8 +303,8 @@ def build_transaction(
                 'regtest mode expects the coinbase outpoint %s:0' % coinbase_txid
             )
 
-    address, wif, pubkey = key_info(private_key, network)
-    kind = kind or InputKind.P2WPKH
+    kind = kind or InputKind.P2PKH
+    address, wif, pubkey = key_info(private_key, network, kind)
 
     if kind == InputKind.P2PKH:
         script_pubkey = p2pkh_script(pubkey)
@@ -336,7 +350,7 @@ def sign_raw_transaction(
     if kinds is None:
         kinds = [script_kind_from_script(spk) for spk, _ in prevouts]
     signed, infos = sign_transaction_kinds(tx, private_key, prevouts, kinds, sighash_type)
-    address, wif, pubkey = key_info(private_key)
+    address, wif, pubkey = key_info(private_key, kind=kinds[0] if kinds else InputKind.P2PKH)
     return BuiltTransaction(
         transaction=signed,
         signatures=infos,
@@ -365,7 +379,7 @@ def parse_transaction_hex(raw_hex: str) -> Transaction:
 def make_unsigned(
     inputs: Sequence[str],
     outputs: Sequence[str],
-    network: str = 'testnet',
+    network: str = 'mainnet',
     version: int = 2,
     locktime: int = 0,
 ) -> Transaction:
