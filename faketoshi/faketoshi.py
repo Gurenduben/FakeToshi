@@ -17,7 +17,7 @@ signature.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from .curve import (
     G,
@@ -28,6 +28,7 @@ from .curve import (
     point_add,
     point_add_two_muls,
     point_base_mul,
+    point_from_x,
     point_mul,
 )
 
@@ -142,3 +143,156 @@ def generate_forgery(x_coord: str, y_coord: str, randbelow=None) -> Optional[Fak
     sig = Signature(rx, rx * inv_b % N)
     msg = rx * a * inv_b % N
     return FaketoshiCredentials(sig=sig, msg=msg, pub_key=PublicKey(public_point))
+
+
+# ---------------------------------------------------------------------------
+# Inspecting a claim: "here is my transaction hash, plus r and s"
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Inspection:
+    """Result of checking a ``(r, s, z)`` triple against a claimed public key.
+
+    ``valid`` mirrors :func:`hashless_verify` for the claimed key.  The
+    ``recovered_keys`` list holds the public keys for which the same ``(r, s)``
+    *does* verify — see :func:`recover_public_keys` for why that matters.
+    """
+
+    r: int
+    s: int
+    z: int
+    claimed_key: Optional[PublicKey]
+    valid: bool
+    recovered_keys: Tuple[PublicKey, ...]
+
+    def __str__(self) -> str:
+        lines = [
+            'r: %d' % self.r,
+            's: %d' % self.s,
+            'z: %d' % self.z,
+            'txid: %s' % format_tx_hash(self.z),
+        ]
+        if self.claimed_key is not None:
+            lines.append('Claimed key: %s' % self.claimed_key)
+        lines.append('Valid for claimed key: %s' % ('yes' if self.valid else 'no'))
+        for i, key in enumerate(self.recovered_keys):
+            lines.append('Recoverable key %d: %s' % (i, key))
+        return '\n'.join(lines)
+
+
+def tx_hash_to_z(tx_hash: str) -> int:
+    """Interpret a transaction hash as ECDSA ``z``.
+
+    Accepts a 64-character hex string (with or without ``0x``), as printed by
+    explorers, and returns it as an integer — i.e. the digest interpreted
+    big-endian, which is exactly what Bitcoin's ECDSA verifier does with the
+    double-SHA256 of a transaction.
+    """
+    text = tx_hash.strip()
+    if text[:2].lower() == '0x':
+        text = text[2:]
+    if len(text) != 64:
+        raise ValueError(
+            'transaction hash must be 64 hex characters (32 bytes), got %d' % len(text)
+        )
+    z = int(text, 16)
+    if z >= N:
+        # secp256k1 verification reduces z mod n implicitly via (z * w mod n);
+        # keep that reduction explicit so the printed value matches the maths.
+        z %= N
+    return z
+
+
+def format_tx_hash(z: int) -> str:
+    """Render a ``z`` value as the hex string a block explorer would show."""
+    return '%064x' % z
+
+
+def _parse_signature_value(value, name: str, decimal: bool = False) -> int:
+    """Parse ``r`` or ``s``.
+
+    Bare strings are read as hex (the convention for Bitcoin signatures) unless
+    ``decimal`` is true; a ``0x`` prefix always means hex.  The radix is never
+    guessed, because every decimal value is also a syntactically valid hex one.
+    """
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text[:2].lower() == '0x':
+        text = text[2:]
+        decimal = False
+    try:
+        return int(text, 10 if decimal else 16)
+    except ValueError:
+        base = 'decimal' if decimal else 'hex'
+        raise ValueError('could not parse %s as %s: %r' % (name, base, value)) from None
+
+
+def recover_public_keys(r: int, s: int, z: int) -> Tuple[PublicKey, ...]:
+    """Public keys for which ``(r, s)`` is a valid signature over ``z``.
+
+    ECDSA verification rewrites to ``R = (z/s)·G + (r/s)·Q``.  Solving for
+    ``Q`` instead:
+
+        Q = r⁻¹ · (s·R − z·G)
+
+    Since ``R`` is any point whose x coordinate equals ``r`` (mod n) and
+    secp256k1 has two such points (y and −y), there are at most two candidate
+    keys.  Given only ``(r, s, z)`` there is no way to tell which — if any —
+    is the real signer, which is why a "signature" alone proves nothing about
+    who produced it.
+    """
+    inv_r = inverse(r, N)
+    if inv_r is None:
+        return ()
+
+    keys = []
+    for odd in (False, True):
+        big_r = point_from_x(r, odd)
+        if big_r is None:
+            continue
+        # Q = r⁻¹ * (s*R - z*G) = (s*r⁻¹)*R + (-z*r⁻¹)*G
+        q = point_add_two_muls(s * inv_r % N, big_r, (-z * inv_r) % N, G)
+        if q is None or q in keys:
+            continue
+        keys.append(PublicKey(q))
+    return tuple(keys)
+
+
+def inspect_claim(
+    tx_hash: str,
+    r,
+    s,
+    x_coord: Optional[str] = None,
+    y_coord: Optional[str] = None,
+    decimal: bool = False,
+) -> Inspection:
+    """Decode a claimed signature and check it against a public key.
+
+    ``tx_hash`` is the 32-byte hex transaction hash used as ``z`` (the message
+    hash), ``r`` and ``s`` are the signature values as ints or hex strings, and
+    the optional coordinates identify the key being claimed.  When omitted,
+    the Genesis block key is used.
+    """
+    r_int = _parse_signature_value(r, 'r', decimal)
+    s_int = _parse_signature_value(s, 's', decimal)
+    z = tx_hash_to_z(tx_hash)
+
+    if x_coord is None or y_coord is None:
+        claimed: Optional[PublicKey] = None
+    else:
+        point: Point = (int(x_coord, 16), int(y_coord, 16))
+        if not is_on_curve(point):
+            raise ValueError('public key point is not on secp256k1')
+        claimed = PublicKey(point)
+
+    sig = Signature(r_int, s_int)
+    valid = claimed is not None and hashless_verify(claimed, sig, z)
+    return Inspection(
+        r=r_int,
+        s=s_int,
+        z=z,
+        claimed_key=claimed,
+        valid=valid,
+        recovered_keys=recover_public_keys(r_int, s_int, z),
+    )

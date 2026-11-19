@@ -23,6 +23,9 @@ python -m faketoshi          # forge for the Genesis block pubkey
 python -m faketoshi --json   # machine-readable output
 python -m faketoshi --x <hex> --y <hex>   # any other Satoshi pubkey
 
+# Inspect a claim: your transaction hash plus r and s
+python -m faketoshi verify --txid <64-hex-txid> --r <hex> --s <hex>
+
 # Optionally install the `faketoshi` command
 pip install -e .
 faketoshi
@@ -53,6 +56,44 @@ s = r·b⁻¹ mod n      z = r·a·b⁻¹ mod n
 message. Verification here is "hashless": `z` is used directly, with no hashing
 step, exactly as in the original implementation.
 
+### Checking a claim (tx hash → r, s, z)
+
+Already have a transaction hash and someone's `r`/`s`? `verify` decodes them and
+tells you whether they actually validate for the claimed key:
+
+```
+$ python -m faketoshi verify --txid <64-hex-txid> --r 0x<hex> --s 0x<hex>
+r: 104292152526504073417039695267310701787131548716728747048188210357489653668428
+s: 15304645249139486252745633290151691593355992781340320034292527119815455925986
+z: 27492682039654594488495269414934967390315654912485842810069785923538281112352
+txid: 3cc84e7d342c83a523972674cf40faecd3b68ad687bbaffb7bc4d680de112320
+Claimed key: (PublicKey 27508215986895653998444253056742679122811041256676723492045000752796524536365 14241215197100020720497056274756249375352291733590383593029593693896383225316)
+Valid for claimed key: yes
+Recoverable key 0: (PublicKey 91115180070214885452469887462397640982075413200794526559784006358321412533085 95129171953199970708625660034647388438999789667275228803567994047138938480436)
+Recoverable key 1: (PublicKey 27508215986895653998444253056742679122811041256676723492045000752796524536365 14241215197100020720497056274756249375352291733590383593029593693896383225316)
+```
+
+- `--txid` is interpreted as `z`: the 32-byte hash read big-endian, exactly how
+  Bitcoin's verifier treats the double-SHA256 of a transaction (`0x` optional).
+- `--r` / `--s` are hex by default (with or without `0x`); add `--dec` to read
+  them as decimal. The radix is never guessed — every decimal number is also a
+  valid hex one, so guessing would silently change the values.
+- `--x` / `--y` are the claimed public key; they default to the Genesis key.
+- `--json` emits the same information as structured data.
+- Exit codes: `0` valid for the claimed key, `1` not valid, `2` bad input.
+
+The `Recoverable key` lines are the public keys for which those exact `r`, `s`
+and `z` *do* verify. Verification rewrites to `R = (z/s)·G + (r/s)·Q`, so
+solving for the key gives `Q = r⁻¹·(s·R − z·G)` with `R` any point whose x
+coordinate equals `r` — at most two candidates, and no way to tell which one
+signed. **A signature on its own therefore proves nothing about who made it**;
+only checking it against a known public key does. (This is the same reason
+"hand me a signature and I'll tell you it's Satoshi" claims are hollow.)
+
+Note that this checks a signature *you already have*. It cannot produce valid
+`(r, s)` for a transaction hash of your choosing under someone else's public
+key — that is the ECDSA problem itself.
+
 ### As a library
 
 ```python
@@ -62,6 +103,18 @@ from faketoshi.__main__ import GENESIS_X, GENESIS_Y
 forgery = generate_forgery(GENESIS_X, GENESIS_Y)
 assert valid_forgery(forgery)
 print(forgery.sig.r, forgery.sig.s, forgery.msg)
+```
+
+```python
+from faketoshi import inspect_claim, recover_public_keys, tx_hash_to_z, format_tx_hash
+
+result = inspect_claim(txid, r_hex, s_hex, GENESIS_X, GENESIS_Y)   # radix = hex
+result.valid            # does it verify for that key?
+result.z, result.r      # decoded values
+str(result)             # the human-readable report shown above
+
+recover_public_keys(r, s, tx_hash_to_z(txid))   # the keys it does verify for
+format_tx_hash(z)                                # hex form of a z value
 ```
 
 ### Tests
@@ -75,6 +128,8 @@ python -m unittest discover -s tests -t . -v
 This repository was originally written in Haskell against the `cryptonite`
 package; it is now plain Python with no third-party dependencies. The secp256k1
 arithmetic lives in `faketoshi/curve.py`, the forging and verification logic in
-`faketoshi/faketoshi.py`, and the CLI in `faketoshi/__main__.py`. The curve is
+`faketoshi/faketoshi.py`, and the CLI in `faketoshi/__main__.py`. Key recovery
+lives in `recover_public_keys`, and point decompression (needed to recover keys
+from `r`) in `curve.point_from_x`. The curve is
 fixed to secp256k1 (the only curve the original used), and a public key point
 that is not on the curve raises `ValueError` instead of producing garbage.

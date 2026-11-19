@@ -9,11 +9,16 @@ import unittest
 from faketoshi import (
     G,
     N,
+    PublicKey,
     Signature,
     generate_forgery,
+    hashless_verify,
+    inspect_claim,
     is_on_curve,
     point_add,
     point_base_mul,
+    recover_public_keys,
+    tx_hash_to_z,
     valid_forgery,
 )
 from faketoshi.__main__ import GENESIS_X, GENESIS_Y, main
@@ -95,6 +100,115 @@ class ForgeryTest(unittest.TestCase):
         self.assertFalse(valid_forgery(swapped))
 
 
+def _sign(private_key: int, z: int, nonce: int = 424242):
+    """Textbook ECDSA signer, used to check that key recovery finds the signer."""
+    r = point_base_mul(nonce)[0] % N
+    s = pow(nonce, -1, N) * (z + r * private_key) % N
+    return Signature(r, s), public_key_for(private_key)
+
+
+def public_key_for(private_key: int):
+    return PublicKey(point_base_mul(private_key))
+
+
+class InspectTest(unittest.TestCase):
+    TXID = 'aa' * 32
+
+    def test_z_from_txid(self):
+        self.assertEqual(tx_hash_to_z(self.TXID), int('aa' * 32, 16))
+        self.assertEqual(tx_hash_to_z('0x' + self.TXID), int('aa' * 32, 16))
+        self.assertEqual(tx_hash_to_z('0X' + self.TXID), int('aa' * 32, 16))
+
+    def test_z_rejects_bad_input(self):
+        for bad in ['', 'aa', 'zz' * 32, 'aa' * 31]:
+            with self.assertRaises(ValueError):
+                tx_hash_to_z(bad)
+
+    def test_z_is_reduced_mod_n(self):
+        self.assertLess(tx_hash_to_z('ff' * 32), N)
+
+    def test_forged_triple_validates_and_recovers_genesis_key(self):
+        forgery = generate_forgery(GENESIS_X, GENESIS_Y)
+        result = inspect_claim(
+            '%064x' % forgery.msg,
+            forgery.sig.r,
+            forgery.sig.s,
+            GENESIS_X,
+            GENESIS_Y,
+        )
+        self.assertTrue(result.valid)
+        self.assertEqual(result.z, forgery.msg)
+        self.assertIn(PublicKey((int(GENESIS_X, 16), int(GENESIS_Y, 16))), result.recovered_keys)
+
+    def test_hex_and_decimal_parsing_agree(self):
+        forgery = generate_forgery(GENESIS_X, GENESIS_Y)
+        txid = '%064x' % forgery.msg
+        as_hex = inspect_claim(txid, '%x' % forgery.sig.r, '%x' % forgery.sig.s, GENESIS_X, GENESIS_Y)
+        as_dec = inspect_claim(
+            txid, str(forgery.sig.r), str(forgery.sig.s), GENESIS_X, GENESIS_Y, decimal=True
+        )
+        self.assertEqual(as_hex, as_dec)
+        self.assertTrue(as_hex.valid)
+
+    def test_hex_prefix_is_honoured(self):
+        forgery = generate_forgery(GENESIS_X, GENESIS_Y)
+        result = inspect_claim(
+            '%064x' % forgery.msg,
+            '0x%x' % forgery.sig.r,
+            '0x%x' % forgery.sig.s,
+            GENESIS_X,
+            GENESIS_Y,
+        )
+        self.assertTrue(result.valid)
+
+    def test_wrong_key_is_reported_as_invalid(self):
+        forgery = generate_forgery(GENESIS_X, GENESIS_Y)
+        result = inspect_claim(
+            '%064x' % forgery.msg,
+            forgery.sig.r,
+            forgery.sig.s,
+            '%064x' % G[0],  # generator, not the claimed signer
+            '%064x' % G[1],
+        )
+        self.assertFalse(result.valid)
+        # Recovery is independent of the claimed key: every recovered key must
+        # genuinely verify, and the claimed one must not be among them here.
+        for key in result.recovered_keys:
+            self.assertTrue(hashless_verify(key, Signature(result.r, result.s), result.z))
+        self.assertNotIn(PublicKey((G[0], G[1])), result.recovered_keys)
+
+    def test_recovery_finds_a_real_signer(self):
+        private_key = 0xC0FFEE
+        z = tx_hash_to_z('11' * 32)
+        sig, expected = _sign(private_key, z)
+        recovered = recover_public_keys(sig.r, sig.s, z)
+        self.assertIn(expected, recovered)
+        for key in recovered:
+            self.assertTrue(hashless_verify(key, sig, z))
+
+    def test_recovery_of_forgery_keys_all_verify(self):
+        forgery = generate_forgery(GENESIS_X, GENESIS_Y)
+        keys = recover_public_keys(forgery.sig.r, forgery.sig.s, forgery.msg)
+        self.assertEqual(len(keys), 2)
+        for key in keys:
+            self.assertTrue(hashless_verify(key, forgery.sig, forgery.msg))
+
+    def test_non_invertible_r_recovers_nothing(self):
+        self.assertEqual(recover_public_keys(0, 12345, 999), ())
+
+    def test_off_curve_claimed_key_raises(self):
+        with self.assertRaises(ValueError):
+            inspect_claim(self.TXID, 1, 1, '01', '02')
+
+    def test_text_output_mentions_txid(self):
+        forgery = generate_forgery(GENESIS_X, GENESIS_Y)
+        result = inspect_claim('%064x' % forgery.msg, forgery.sig.r, forgery.sig.s, GENESIS_X, GENESIS_Y)
+        text = str(result)
+        self.assertIn('txid: ', text)
+        self.assertIn('Valid for claimed key: yes', text)
+        self.assertIn('Recoverable key', text)
+
+
 class CliTest(unittest.TestCase):
     def test_cli_prints_forgery(self):
         import contextlib
@@ -119,6 +233,64 @@ class CliTest(unittest.TestCase):
         payload = json.loads(buf.getvalue())
         self.assertIn('r', payload)
         self.assertIn('msg_hash', payload)
+
+
+class VerifyCliTest(unittest.TestCase):
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _forged(self):
+        forgery = generate_forgery(GENESIS_X, GENESIS_Y)
+        return [
+            'verify',
+            '--txid', '%064x' % forgery.msg,
+            '--r', '%x' % forgery.sig.r,
+            '--s', '%x' % forgery.sig.s,
+        ]
+
+    def test_valid_claim_exits_zero(self):
+        rc, out, _ = self._run(self._forged())
+        self.assertEqual(rc, 0)
+        self.assertIn('Valid for claimed key: yes', out)
+
+    def test_invalid_claim_exits_one(self):
+        argv = self._forged()
+        argv[argv.index('--r') + 1] = '1'
+        rc, out, _ = self._run(argv)
+        self.assertEqual(rc, 1)
+        self.assertIn('Valid for claimed key: no', out)
+
+    def test_bad_txid_exits_two(self):
+        rc, _, err = self._run(['verify', '--txid', 'nothex', '--r', '1', '--s', '1'])
+        self.assertEqual(rc, 2)
+        self.assertIn('error:', err)
+
+    def test_json_shape(self):
+        import json
+
+        argv = self._forged() + ['--json']
+        rc, out, _ = self._run(argv)
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(len(payload['txid']), 64)
+        self.assertTrue(payload['valid_for_claimed_key'])
+        self.assertEqual(len(payload['recovered_keys']), 2)
+        self.assertIn('x', payload['claimed_key'])
+
+    def test_forge_json_includes_hex_and_txid(self):
+        import json
+
+        rc, out, _ = self._run(['--json'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(int(payload['r_hex'], 16), int(payload['r']))
+        self.assertEqual(int(payload['txid'], 16), int(payload['msg_hash']))
 
 
 if __name__ == '__main__':

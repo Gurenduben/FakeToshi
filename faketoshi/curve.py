@@ -65,6 +65,24 @@ except TypeError:  # pragma: no cover
             return None
 
 
+def point_from_x(x: int, odd: bool) -> Optional[Tuple[int, int]]:
+    """Recover a curve point from its x coordinate, choosing the y parity.
+
+    secp256k1 has ``p % 4 == 3``, so a square root of ``alpha`` is
+    ``alpha ** ((p + 1) // 4)``.  Returns ``None`` when ``x`` is not the
+    abscissa of any point on the curve.
+    """
+    if x < 0 or x >= P:
+        return None
+    alpha = (x * x * x + 7) % P
+    y = pow(alpha, (P + 1) // 4, P)
+    if (y * y - alpha) % P != 0:
+        return None
+    if (y % 2 == 1) != odd:
+        y = P - y
+    return (x, y)
+
+
 def is_on_curve(point: Point) -> bool:
     """True if ``point`` satisfies ``y^2 = x^3 + 7 (mod P)``."""
     if point is None:
