@@ -15,10 +15,11 @@ You can browse to https://albacore.io/faketoshi for an generator in js that uses
 
 ### How to use
 ```
-git clone git@github.com:albacorelabs/Faketoshi.git
-cd Faketoshi
+git clone https://github.com/Gurenduben/FakeToshi.git
+cd FakeToshi
 
 # No dependencies: Python 3.8+ and the standard library only.
+python faketoshi.py          # same as `python -m faketoshi` (launcher script)
 python -m faketoshi          # forge for the Genesis block pubkey
 python -m faketoshi --json   # machine-readable output
 python -m faketoshi --x <hex> --y <hex>   # any other Satoshi pubkey

@@ -19,6 +19,17 @@ signature.
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+if __package__ in (None, ''):
+    raise SystemExit(
+        'faketoshi.py is part of a package and cannot be run by path.\n'
+        '\n'
+        'From the repository root, use one of:\n'
+        '    python -m faketoshi --help          # run from the repo root\n'
+        '    python faketoshi.py --help          # launcher at the repo root\n'
+        '\n'
+        "You are probably inside the 'faketoshi' package directory; cd .. first."
+    )
+
 from .curve import (
     G,
     N,

@@ -209,6 +209,71 @@ class InspectTest(unittest.TestCase):
         self.assertIn('Recoverable key', text)
 
 
+class LauncherTest(unittest.TestCase):
+    """`python faketoshi.py` from the repo root must work without installing."""
+
+    def setUp(self):
+        import os
+
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.launcher = os.path.join(self.root, 'faketoshi.py')
+
+    def test_launcher_exists_and_is_executable(self):
+        import os
+        import stat
+
+        self.assertTrue(os.path.isfile(self.launcher))
+        mode = os.stat(self.launcher).st_mode
+        self.assertTrue(mode & stat.S_IXUSR, 'launcher should be executable')
+
+    def test_launcher_runs_from_repo_root(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, self.launcher, '--help'],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('usage: faketoshi', result.stdout)
+
+    def test_launcher_runs_from_another_directory(self):
+        import subprocess
+        import sys
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as elsewhere:
+            result = subprocess.run(
+                [sys.executable, self.launcher, 'keygen', '--network', 'testnet', '--json'],
+                cwd=elsewhere,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"address"', result.stdout)
+
+    def test_module_prints_a_helpful_error_when_run_by_path(self):
+        import os
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, 'faketoshi.py'],
+            cwd=os.path.join(self.root, 'faketoshi'),  # the module, not the launcher
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('ImportError', result.stderr)
+        self.assertIn('cannot be run by path', result.stderr)
+        self.assertIn('python -m faketoshi', result.stderr)
+
+
 class CliTest(unittest.TestCase):
     def test_cli_prints_forgery(self):
         import contextlib
