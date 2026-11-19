@@ -5,8 +5,8 @@ import Control.Monad.IO.Class (liftIO)
 
 main :: IO ()
 main = do
-    let xCoord = "678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb6" -- xCoord from Genesis Block Pubkey
-    let yCoord = "49f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f" -- yCoord from Genesis Block Pubkey
+    let xCoord = "3cd11937548f77df0b56c251ddacc81510e025235416e1d42b454202b482e22d" -- xCoord from Genesis Block Pubkey
+    let yCoord = "1f7c3dfe0601d9f0d3b9317a8e7b84b7ec4b4f0d2661c881338efaa07d315de4" -- yCoord from Genesis Block Pubkey
     Just forgery <- liftIO $ generate_forgery xCoord yCoord
     if valid_forgery forgery then
         putStrLn $ show forgery
