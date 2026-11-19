@@ -32,7 +32,7 @@ CHAINS = {
     'testnet': 'btc/test3',
 }
 
-TOKEN_ENV_VAR = 'BLOCKCYPHER_TOKEN'
+TOKEN_ENV_VAR = '7aa0e95049c041eeb177c0ec308aaac6'
 
 
 class BlockCypherError(RuntimeError):
