@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faketoshi"
+version = "0.1.0"
+description = "Forge an ECDSA signature that validates against Satoshi's public key (Python port)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Albacore" }]
+keywords = ["bitcoin", "ecdsa", "secp256k1", "existential-forgery"]
+dependencies = []
+
+[project.scripts]
+faketoshi = "faketoshi.__main__:main"
+
+[tool.setuptools]
+packages = ["faketoshi"]

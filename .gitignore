@@ -1,1 +1,8 @@
 .stack-work
+
+# Python port
+__pycache__/
+*.py[cod]
+*.egg-info/
+python/build/
+python/dist/
