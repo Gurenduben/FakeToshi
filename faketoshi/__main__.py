@@ -14,6 +14,7 @@ Usage:
 import argparse
 import json
 import sys
+from typing import Optional
 
 from .faketoshi import (
     format_tx_hash,
@@ -252,6 +253,39 @@ def build_parser() -> argparse.ArgumentParser:
         '--input-specs', action='store_true', help='print TXID:VOUT:AMOUNT lines only'
     )
     unspent.add_argument('--json', action='store_true')
+
+    spend = subparsers.add_parser(
+        'spend',
+        help='guided send: asks for the txid to get r/s/z and the address to send to',
+        description=(
+            'Interactive flow. Asks for the transaction id holding the coins (looked '
+            'up via BlockCypher to get the real amount, which segwit signing needs), '
+            'then the destination address and amount, builds and signs the '
+            'transaction, prints its r/s/z per input, and offers to broadcast.'
+        ),
+    )
+    _add_key_source(spend)
+    spend.add_argument('--network', default='testnet', choices=sorted(_CHAINS))
+    spend.add_argument('--token', default=None, help='BlockCypher token (prefer the env var)')
+    spend.add_argument('--txid', help='previous transaction id (asked for if omitted)')
+    spend.add_argument('--vout', type=int, help='output index to spend')
+    spend.add_argument('--address', help='destination address')
+    spend.add_argument('--amount', type=int, help='amount to send, in satoshis')
+    spend.add_argument('--fee', type=int, default=1000, help='fee in satoshis (default 1000)')
+    spend.add_argument('--change', help='change address (defaults to your own address)')
+    spend.add_argument(
+        '--kind',
+        default=InputKind.P2WPKH,
+        choices=[InputKind.P2WPKH, InputKind.P2PKH],
+        help='script type of the coin being spent',
+    )
+    spend.add_argument(
+        '--offline',
+        action='store_true',
+        help='do not contact BlockCypher; requires --vout and the amount to be known',
+    )
+    spend.add_argument('--broadcast', action='store_true', help='push it after signing')
+    spend.add_argument('--json', action='store_true', help='non-interactive: print JSON')
 
     balance = subparsers.add_parser('balance', help='address balance via BlockCypher')
     balance.add_argument('address')
@@ -784,6 +818,196 @@ def _unspent(args) -> int:
     return 0
 
 
+def _ask(prompt: str, default: str = '') -> str:
+    """Ask a question on a terminal; return ``default`` on empty/EOF input."""
+    suffix = ' [%s]' % default if default else ''
+    label = '%s%s: ' % (prompt, suffix)
+    # Print the question ourselves so it is captured wherever stdout goes.
+    print(label, end='', flush=True)
+    try:
+        answer = input().strip()
+    except EOFError:
+        print()
+        return default
+    return answer or default
+
+
+def _ask_int(prompt: str, default: Optional[int] = None) -> Optional[int]:
+    while True:
+        text = _ask(prompt, '' if default is None else str(default))
+        if not text:
+            return default
+        try:
+            return int(text.replace('_', '').replace(',', ''))
+        except ValueError:
+            print('  please enter a whole number (satoshis)')
+
+
+def _spend(args) -> int:
+    interactive = not args.json
+    network = args.network
+
+    try:
+        private_key = resolve_private_key(args.wif, args.key)
+    except ValueError as exc:
+        return _fail(exc)
+    address, wif, pubkey = key_info(private_key, network)
+
+    # --- 1. which coins? ask for the txid, then read the amount from the chain
+    if interactive:
+        print('You are spending from %s (your address for this key)' % address)
+    txid = args.txid
+    if not txid:
+        if not interactive:
+            return _fail(ValueError('--txid is required with --json'))
+        txid = _ask('Transaction id holding the coins (txid)')
+    txid = (txid or '').strip()
+    if len(txid) != 64:
+        return _fail(ValueError('txid must be 64 hex characters'))
+
+    prevout_value: Optional[int] = None
+    vout = args.vout
+    if not args.offline:
+        client = _client(args)
+        try:
+            prev = client.previous_transaction(txid)
+        except (BlockCypherError, ValueError) as exc:
+            return _fail(exc)
+
+        spendable = prev.unspent()
+        if not spendable:
+            return _fail(ValueError('every output of %s is already spent' % txid))
+
+        if vout is None:
+            if not interactive:
+                if len(spendable) != 1:
+                    return _fail(
+                        ValueError(
+                            '%d unspent outputs in this transaction; pick one with --vout'
+                            % len(spendable)
+                        )
+                    )
+                vout = spendable[0].index
+            if interactive:
+                print('\nOutputs of %s:' % txid)
+                for output in prev.outputs:
+                    print('  %s' % output)
+            if len(spendable) == 1:
+                vout = spendable[0].index
+                if interactive:
+                    print('\nUsing vout %d' % vout)
+            else:
+                vout = _ask_int('Which output index (vout) to spend?', spendable[0].index)
+
+        match = [o for o in prev.outputs if o.index == vout]
+        if not match:
+            return _fail(ValueError('txid has no output %d' % vout))
+        if match[0].spent_by:
+            return _fail(ValueError('output %d of %s is already spent' % (vout, txid)))
+        prevout_value = match[0].value
+        if interactive:
+            print('Spending %d sats (vout %d)' % (prevout_value, vout))
+    else:
+        if interactive:
+            print('Offline mode: no chain lookup, amounts must be correct')
+        if vout is None:
+            return _fail(ValueError('--offline needs --vout'))
+        if args.amount is None:
+            return _fail(
+                ValueError(
+                    'offline mode cannot look up the input amount; pass the amount '
+                    'explicitly with --json --amount (it is part of the signature)'
+                )
+            )
+
+    # --- 2. where to, and how much?
+    destination = args.address
+    if not destination:
+        if not interactive:
+            return _fail(ValueError('--address is required with --json'))
+        destination = _ask('Address to send to')
+    destination = (destination or '').strip()
+    try:
+        destination_script = address_to_script(destination, network)
+    except ValueError as exc:
+        return _fail(exc)
+
+    if prevout_value is None:
+        prevout_value = args.amount
+        if prevout_value is None:
+            return _fail(ValueError('the input amount is unknown; pass --amount'))
+
+    amount = args.amount
+    if amount is None:
+        if not interactive:
+            return _fail(ValueError('--amount is required with --json'))
+        suggested = prevout_value - args.fee
+        amount = _ask_int(
+            'Amount to send in satoshis (max %d)' % suggested, suggested
+        )
+
+    if amount <= 0:
+        return _fail(ValueError('amount must be positive'))
+    if amount > prevout_value - args.fee:
+        return _fail(
+            ValueError(
+                'amount %d exceeds input %d minus the %d sat fee'
+                % (amount, prevout_value, args.fee)
+            )
+        )
+
+    change = amount and prevout_value - amount - args.fee
+    change_address = args.change or address
+    try:
+        destination_spec = '%s:%d' % (destination, amount)
+        output_specs = [destination_spec]
+        if change > 0:
+            output_specs.append('%s:%d' % (change_address, change))
+        built = build_transaction(
+            inputs=['%s:%d:%d' % (txid, vout, prevout_value)],
+            outputs=output_specs,
+            private_key=private_key,
+            network=network,
+            kind=args.kind,
+        )
+    except ValueError as exc:
+        return _fail(exc)
+
+    # --- 3. show the signature material and offer to broadcast
+    if args.json:
+        _report_built(built, True)
+    else:
+        print()
+        print(built.report())
+        print()
+        print('raw transaction: %s' % built.hex)
+
+    if not (args.broadcast or interactive):
+        return 0
+
+    if interactive:
+        answer = _ask('Broadcast this transaction now? (y/N)', 'n').lower()
+        if answer not in ('y', 'yes'):
+            print('Not broadcast. The signed hex is above if you want to send it yourself.')
+            return 0
+
+    client = _client(args)
+    try:
+        result = client.push(built.hex)
+    except (BlockCypherError, ValueError) as exc:
+        return _fail(exc)
+    if args.json:
+        print(json.dumps({'txid': result.tx_hash, 'response': result.raw}, indent=2))
+    else:
+        print(result)
+        if result.tx_hash and result.tx_hash != built.txid:
+            print(
+                'warning: node reported txid %s, locally computed %s'
+                % (result.tx_hash, built.txid)
+            )
+    return 0
+
+
 def _balance(args) -> int:
     try:
         data = _client(args).balance(args.address)
@@ -847,6 +1071,7 @@ def _broadcast(args) -> int:
 
 
 _HANDLERS = {
+    'spend': _spend,
     'unspent': _unspent,
     'balance': _balance,
     'broadcast': _broadcast,
