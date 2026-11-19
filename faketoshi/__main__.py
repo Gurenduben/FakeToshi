@@ -124,6 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[InputKind.P2PKH, InputKind.P2WPKH],
         help='address type (default p2pkh; p2wpkh for bech32)',
     )
+    address.add_argument(
+        '--all',
+        action='store_true',
+        help='list every address type this key controls (compressed, segwit, wrapped)',
+    )
     address.add_argument('--json', action='store_true')
 
     sign = subparsers.add_parser(
@@ -196,6 +201,10 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar='SCRIPT:AMOUNT_SATS',
         help='scriptPubKey (hex) and amount of each input being spent',
+    )
+    signraw.add_argument(
+        '--redeem-script',
+        help='redeemScript hex (required to spend P2SH-P2WPKH coins)',
     )
     signraw.add_argument('--sighash', type=lambda v: int(v, 0), default=0x01)
     signraw.add_argument('--json', action='store_true')
@@ -302,6 +311,14 @@ def build_parser() -> argparse.ArgumentParser:
         help='do not contact BlockCypher; requires --vout and the amount to be known',
     )
     spend.add_argument('--broadcast', action='store_true', help='push it after signing')
+    spend.add_argument(
+        '--from',
+        dest='from_address',
+        help=(
+            'the address you expect to be spending from; fails fast if it does not '
+            'match your key (guards against mixing up compressed/segwit keys)'
+        ),
+    )
     spend.add_argument('--json', action='store_true', help='non-interactive: print JSON')
 
     balance = subparsers.add_parser('balance', help='address balance via BlockCypher')
@@ -437,6 +454,38 @@ def _address(args) -> int:
         address, wif, pubkey = key_info(private_key, args.network, args.kind)
     except ValueError as exc:
         return _fail(exc)
+
+    if args.all:
+        from .wallet import address_types
+
+        types = address_types(pubkey, args.network)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        'network': args.network,
+                        'public_key': pubkey.hex(),
+                        'compressed': len(pubkey) == 33,
+                        'addresses': {
+                            name: {'address': value, 'note': note}
+                            for name, (value, note) in types.items()
+                        },
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print('network:      %s' % args.network)
+            print('public key:   %s (%s)' % (pubkey.hex(), 'compressed' if len(pubkey) == 33 else 'uncompressed'))
+            print('signing with: %s' % args.kind)
+            print()
+            for name, (value, note) in types.items():
+                marker = '*' if name == args.kind else ' '
+                print('%s %-20s %s' % (marker, name, value))
+                print('  %-20s %s' % ('', note))
+            print()
+            print('* = the address this tool spends from by default')
+        return 0
     payload = {
         'network': args.network,
         'address': address,
@@ -569,7 +618,32 @@ def _signraw(args) -> int:
         for spec in args.prevout:
             script_text, _, amount_text = spec.rpartition(':')
             prevouts.append((bytes.fromhex(script_text), int(amount_text)))
-        built = sign_raw_transaction(args.raw, private_key, prevouts, sighash_type=args.sighash)
+        kinds = None
+        if args.redeem_script:
+            from .sighash_single import p2sh_script
+
+            p2sh_spk = p2sh_script(bytes.fromhex(args.redeem_script))
+            if not any(script == p2sh_spk for script, _ in prevouts):
+                raise ValueError(
+                    'no --prevout matches that redeemScript; expected scriptPubKey %s'
+                    % p2sh_spk.hex()
+                )
+            kinds = [
+                InputKind.P2SH_P2WPKH if script == p2sh_spk else InputKind.P2PKH
+                for script, _ in prevouts
+            ]
+        elif any(
+            len(script) == 23 and script[0] == 0xA9 and script[-1] == 0x87
+            for script, _ in prevouts
+        ):
+            raise ValueError(
+                'a --prevout is a P2SH scriptPubKey (a914..87). To spend P2SH-P2WPKH '
+                'coins, pass --redeem-script <hex>: the redeemScript is 0014 followed '
+                'by the hash160 of your compressed public key.'
+            )
+        built = sign_raw_transaction(
+            args.raw, private_key, prevouts, kinds=kinds, sighash_type=args.sighash
+        )
     except ValueError as exc:
         return _fail(exc)
     _report_built(built, args.json)
@@ -869,6 +943,53 @@ def _spend(args) -> int:
     except ValueError as exc:
         return _fail(exc)
     address, wif, pubkey = key_info(private_key, network, args.kind)
+
+    # --- 0. make sure the user knows which address they are spending from ----
+    if interactive:
+        print('key format:  compressed (%d-byte public key)' % len(pubkey))
+    if args.from_address:
+        from .encoding import hash160
+        from .wallet import address_types
+
+        expected = (args.from_address or '').strip()
+        supported = address_types(pubkey, network)
+        match = [name for name, (value, _) in supported.items() if value == expected]
+        if not match:
+            hints = ['\naddresses this key controls on %s:' % network]
+            for name, (value, note) in supported.items():
+                hints.append('  %-20s %s  (%s)' % (name, value, note))
+            return _fail(
+                ValueError(
+                    '%s is not an address this key controls%s'
+                    % (expected, '\n'.join(hints))
+                )
+            )
+        if match[0] == 'p2pkh-uncompressed':
+            return _fail(
+                ValueError(
+                    'that is the uncompressed-key address (%s); this tool only signs '
+                    'with compressed keys. Use %s instead.'
+                    % (expected, supported['p2pkh'][0])
+                )
+            )
+        if match[0] == 'p2sh-p2wpkh':
+            return _fail(
+                ValueError(
+                    'that is a wrapped-segwit address; `spend` only handles p2pkh and '
+                    'p2wpkh. Build the transaction manually and sign it with '
+                    '`signraw --redeem-script %s`.'
+                    % (b'\x00\x14' + hash160(pubkey)).hex()
+                )
+            )
+        if match[0] != args.kind:
+            return _fail(
+                ValueError(
+                    'that address is %s but --kind is %s; pass --kind %s to spend it'
+                    % (match[0], args.kind, match[0])
+                )
+            )
+        if interactive:
+            print('spending from: %s (%s) - matches your key' % (expected, match[0]))
 
     # --- 1. which coins? ask for the txid, then read the amount from the chain
     if interactive:

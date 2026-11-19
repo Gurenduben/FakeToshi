@@ -34,8 +34,10 @@ from faketoshi.signing import (
     verify_z,
     wif_to_private_key,
 )
+from faketoshi.signing import InputKind, sign_transaction_kinds
 from faketoshi.wallet import (
     address_to_script,
+    address_types,
     build_transaction,
     key_info,
     make_unsigned,
@@ -518,3 +520,142 @@ class SigningCliTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AddressTypesTest(unittest.TestCase):
+    """Every address a compressed key controls, and which one is spendable."""
+
+    KEY = int('11' * 32, 16)
+
+    def test_known_addresses_for_repeated_key(self):
+        pubkey = private_key_to_public_key(self.KEY, compressed=True)
+        types = address_types(pubkey, 'mainnet')
+        self.assertEqual(
+            types['p2pkh'][0], '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9'
+        )
+        self.assertEqual(
+            types['p2wpkh'][0], 'bc1ql3e9pgs3mmwuwrh95fecme0s0qtn2880lsvsd5'
+        )
+        self.assertEqual(
+            types['p2pkh-uncompressed'][0], '1MsHWS1BnwMc3tLE8G35UXsS58fKipzB7a'
+        )
+        self.assertEqual(
+            types['p2sh-p2wpkh'][0], '3PFpzMLrKWsphFtc8BesF3MGPnimKMuF4x'
+        )
+
+    def test_p2pkh_is_the_compressed_address(self):
+        pubkey = private_key_to_public_key(self.KEY, compressed=True)
+        types = address_types(pubkey, 'mainnet')
+        self.assertEqual(types['p2pkh'][0], p2pkh_address(pubkey, 'mainnet'))
+        # The uncompressed variant must differ, and be flagged as unspendable.
+        self.assertNotEqual(
+            types['p2pkh'][0], types['p2pkh-uncompressed'][0]
+        )
+        self.assertIn('not spendable', types['p2pkh-uncompressed'][1])
+
+    def test_p2sh_p2wpkh_is_the_script_hash_of_the_p2wpkh_redeem_script(self):
+        pubkey = private_key_to_public_key(self.KEY, compressed=True)
+        types = address_types(pubkey, 'mainnet')
+        redeem = b'\x00\x14' + hash160(pubkey)
+        expected = b58encode_check(b'\x05' + hash160(redeem))
+        self.assertEqual(types['p2sh-p2wpkh'][0], expected)
+
+    def test_networks_give_different_addresses(self):
+        pubkey = private_key_to_public_key(self.KEY, compressed=True)
+        main = address_types(pubkey, 'mainnet')
+        test = address_types(pubkey, 'testnet')
+        self.assertTrue(test['p2pkh'][0].startswith(('m', 'n')))
+        self.assertTrue(test['p2wpkh'][0].startswith('tb1'))
+        self.assertTrue(test['p2sh-p2wpkh'][0].startswith('2'))
+        self.assertNotEqual(main['p2pkh'][0], test['p2pkh'][0])
+
+    def test_key_info_agrees_with_address_types(self):
+        for kind in ('p2pkh', 'p2wpkh', 'p2sh-p2wpkh'):
+            address, _, pubkey = key_info(self.KEY, 'mainnet', kind)
+            self.assertEqual(address, address_types(pubkey, 'mainnet')[kind][0])
+
+
+class P2shP2wpkhTest(unittest.TestCase):
+    """Wrapped-segwit signing.
+
+    The digest and txid below were checked independently against
+    python-bitcointx (``SignatureHash(..., sigversion=1)``) and the DER
+    signature against the ``ecdsa`` package.
+    """
+
+    KEY = int('11' * 32, 16)
+    SCRIPT_PUBKEY = bytes.fromhex('a914ec8f3d9c2763a0997a465b968d99db47e82e69d287')
+    REDEEM_SCRIPT = '0014fc7250a211deddc70ee5a2738de5f07817351cef'
+    EXPECTED_Z = (
+        78694592489469848955983233446202368543486005624236309099218919710303217640930
+    )
+    EXPECTED_TXID = (
+        'c6afd5d2b92c28bb2fc91b835c67337dea5b3d443847801007b19c2045dc36e8'
+    )
+
+    def _unsigned(self):
+        return make_unsigned(
+            ['aa' * 32 + ':0:100000'],
+            ['1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9:90000'],
+        )
+
+    def test_detect_input_kind_sees_p2sh(self):
+        from faketoshi.signing import detect_input_kind
+
+        self.assertEqual(
+            detect_input_kind(self.SCRIPT_PUBKEY), InputKind.P2SH_P2WPKH
+        )
+
+    def test_signs_with_redeem_script_in_script_sig(self):
+        built = sign_raw_transaction(
+            self._unsigned().hex(),
+            self.KEY,
+            [(self.SCRIPT_PUBKEY, 100000)],
+            kinds=[InputKind.P2SH_P2WPKH],
+        )
+        txin = built.transaction.inputs[0]
+        self.assertEqual(txin.script_sig.hex(), '16' + self.REDEEM_SCRIPT)
+        self.assertEqual(len(txin.witness), 2)  # signature + pubkey
+        self.assertTrue(built.transaction.is_segwit())
+
+    def test_digest_matches_independent_bip143_computation(self):
+        built = sign_raw_transaction(
+            self._unsigned().hex(),
+            self.KEY,
+            [(self.SCRIPT_PUBKEY, 100000)],
+            kinds=[InputKind.P2SH_P2WPKH],
+        )
+        info = built.signatures[0]
+        self.assertEqual(info.z, self.EXPECTED_Z)
+        self.assertEqual(info.kind, InputKind.P2SH_P2WPKH)
+        self.assertEqual(built.transaction.txid(), self.EXPECTED_TXID)
+
+    def test_signature_verifies_under_the_compressed_key(self):
+        built = sign_raw_transaction(
+            self._unsigned().hex(),
+            self.KEY,
+            [(self.SCRIPT_PUBKEY, 100000)],
+            kinds=[InputKind.P2SH_P2WPKH],
+        )
+        info = built.signatures[0]
+        pubkey = decode_point(private_key_to_public_key(self.KEY, compressed=True))
+        self.assertTrue(verify_z(pubkey, info.r, info.s, info.z))
+
+    def test_reports_the_p2sh_address(self):
+        built = sign_raw_transaction(
+            self._unsigned().hex(),
+            self.KEY,
+            [(self.SCRIPT_PUBKEY, 100000)],
+            kinds=[InputKind.P2SH_P2WPKH],
+        )
+        self.assertEqual(built.address, '3PFpzMLrKWsphFtc8BesF3MGPnimKMuF4x')
+
+    def test_sign_transaction_kinds_agrees_with_sign_raw_transaction(self):
+        tx = self._unsigned()
+        _, infos = sign_transaction_kinds(
+            tx,
+            self.KEY,
+            [(self.SCRIPT_PUBKEY, 100000)],
+            [InputKind.P2SH_P2WPKH],
+        )
+        self.assertEqual(infos[0].z, self.EXPECTED_Z)

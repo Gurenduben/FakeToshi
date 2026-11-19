@@ -23,6 +23,7 @@ from typing import List, Optional, Sequence, Tuple
 from .curve import N
 from .encoding import (
     NETWORKS,
+    b58encode_check,
     hash160,
     p2pkh_address,
     p2wpkh_address,
@@ -34,6 +35,8 @@ from .encoding import (
 )
 from .signing import (
     InputKind,
+    decode_point,
+    encode_point,
     SignatureInfo,
     Transaction,
     TxIn,
@@ -166,6 +169,33 @@ def script_kind_from_script(script_pubkey: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 
+def address_types(pubkey: bytes, network: str = 'mainnet') -> dict:
+    """Every address this key can control, keyed by kind.
+
+    ``compressed`` keys are what this tool signs with (SEC1 33-byte public
+    keys); the aliases make it obvious which of the listed addresses is the
+    one you can actually spend from.
+    """
+    p2pkh = p2pkh_address(pubkey, network)
+    p2wpkh = p2wpkh_address(pubkey, network)
+    uncompressed = encode_point(decode_point(pubkey), compressed=False)
+    return {
+        'p2pkh': (p2pkh, 'legacy, compressed key'),
+        'p2wpkh': (p2wpkh, 'native segwit (Bech32)'),
+        'p2pkh-uncompressed': (
+            p2pkh_address(uncompressed, network),
+            'legacy, UNCOMPRESSED key - not spendable by this tool',
+        ),
+        'p2sh-p2wpkh': (
+            b58encode_check(
+                bytes([network_params(network)[1]])
+                + hash160(b'\x00\x14' + hash160(pubkey))
+            ),
+            'wrapped segwit (P2SH-P2WPKH) - spendable via signraw',
+        ),
+    }
+
+
 def resolve_private_key(wif: Optional[str] = None, key: Optional[str] = None) -> int:
     """Parse a WIF or hex private key, or generate one when neither is given."""
     if wif and key:
@@ -207,6 +237,8 @@ def key_info(
         address = p2wpkh_address(pubkey, network)
     elif kind == InputKind.P2PKH:
         address = p2pkh_address(pubkey, network)
+    elif kind == InputKind.P2SH_P2WPKH:
+        address = address_types(pubkey, network)['p2sh-p2wpkh'][0]
     else:
         raise ValueError('unsupported address kind %r' % (kind,))
     return address, private_key_to_wif(private_key, network), pubkey

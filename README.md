@@ -30,6 +30,7 @@ python -m faketoshi verify --txid <64-hex-txid> --r <hex> --s <hex>
 # Your own key: r/s/z for a hash, and real signed transactions
 python -m faketoshi keygen
 python -m faketoshi address --wif <wif>
+python -m faketoshi address --key <hex> --all   # every address this key controls
 python -m faketoshi sign --key <hex> --txid <64-hex>
 python -m faketoshi tx --key <hex> \
     --input <TXID>:<VOUT>:<AMOUNT_SATS> --output <ADDRESS>:<SATS>
@@ -105,6 +106,76 @@ Note that this checks a signature *you already have*. It cannot produce valid
 `(r, s)` for a transaction hash of your choosing under someone else's public
 key — that is the ECDSA problem itself.
 
+### Defaults
+
+| setting | default | why | change it with |
+| --- | --- | --- | --- |
+| network | **mainnet** | the addresses you see are the ones that hold real coins | `--network testnet`, `--network regtest` |
+| address kind | **P2PKH** (legacy, compressed key) | universally payable — every wallet and service accepts it | `--kind p2wpkh` |
+| key format | **compressed** (33-byte public key) | fixed; uncompressed WIFs are rejected | not configurable |
+
+Mainnet is the default, so **broadcasting spends real coins**. Every command that
+touches the chain says which network it is on before it signs or sends anything.
+
+### Which address am I spending from?
+
+This tool always signs with **compressed** keys, so the address you can spend
+from is the P2PKH address of the compressed public key. One key has several
+possible addresses, though, and they are not interchangeable — `address --all`
+lists every one of them:
+
+```
+$ python -m faketoshi address --key <hex> --all
+network:      mainnet
+public key:   034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa (compressed)
+signing with: p2pkh
+
+* p2pkh                1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
+                        legacy, compressed key
+  p2wpkh               bc1ql3e9pgs3mmwuwrh95fecme0s0qtn2880lsvsd5
+                        native segwit (Bech32)
+  p2pkh-uncompressed   1MsHWS1BnwMc3tLE8G35UXsS58fKipzB7a
+                        legacy, UNCOMPRESSED key - not spendable by this tool
+  p2sh-p2wpkh          3PFpzMLrKWsphFtc8BesF3MGPnimKMuF4x
+                        wrapped segwit (P2SH-P2WPKH) - spendable via signraw
+
+* = the address this tool spends from by default
+```
+
+`--json` gives the same thing machine-readably (`{"network", "public_key",
+"compressed", "addresses": {kind: {"address", "note"}}}`).
+
+To *assert* which address you are spending from, pass `--from` to `spend`:
+
+```
+$ python -m faketoshi spend --key <hex> --from 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
+key format:  compressed (33-byte public key)
+spending from: 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9 (p2pkh) - matches your key
+...
+```
+
+If the address does not belong to your key, nothing is signed: it prints every
+address the key *does* control and exits. The specific mistakes it catches:
+
+- the **uncompressed** legacy address (`1MsHW…`) → refused, tells you to use the
+  compressed address instead. Coins sent there are not spendable by this tool,
+  because spending them needs an uncompressed-key signature.
+- a **segwit** address with the wrong kind → tells you to add `--kind p2wpkh`.
+- a **wrapped-segwit** address (`3…) → `spend` does not build P2SH transactions;
+  it prints the exact `signraw --redeem-script <hex>` command to use instead.
+
+To spend P2SH-P2WPKH coins with `signraw`, pass the redeemScript — the 22-byte
+`0014` + `hash160(compressed pubkey)`:
+
+```
+$ python -m faketoshi signraw --key <hex> --raw <txhex> \
+      --prevout a914…87:100000 \
+      --redeem-script 0014fc7250a211deddc70ee5a2738de5f07817351cef
+```
+
+`signraw` checks that the redeemScript's hash actually matches one of your
+`--prevout` scriptPubKeys, and refuses if it does not.
+
 ### Signing with your own key
 
 Given your *own* private key, signing is ordinary ECDSA — no forgery involved,
@@ -127,11 +198,11 @@ What does work, and is what this tool now does:
 
 ```
 $ python -m faketoshi keygen
-network:     testnet
+network:     mainnet
 private_key: 41192f4f30bdb35a94c4f2c3b6d9e5ad9f70edc8f06a786e110da070aaa8495a
-wif:         cPmF8MHddMc8nHEwxGSGGyH3Ffdptvf6jkrF3ZaVxBWpFQG4ptWB
+wif:         KyQFfSHnCHuscqmgZrd8uemydSLREUZQfihmw97zT4rozfGdCW5d
 public_key:  03cd26fcd4836fbec4b6017ac3775b8719a0f239dc52d7e7dbd4ec7e8b005d21a3
-address:     1FyqU8e5cLwG2rVh3sT2bN9kQ7mZ4pX1aB
+address:     161a3GdHSCWeWbKJCPeAUPh39HUiQZy8y9
 
 $ python -m faketoshi sign --key 41192f... --txid <64-hex hash>
 r:            41394527160349269893567719044975991464542403203770718342843697060277985947166
@@ -175,15 +246,18 @@ Details that matter:
   give the same signature, so you can re-run and compare. `s` is low-s
   normalised, as consensus/policy requires.
 - Supported spend types: **P2PKH** (default), **P2WPKH**, and P2SH-P2WPKH via
-  the library (`sign_transaction_kinds`). Taproot (Schnorr) is *not* supported.
+  `signraw --redeem-script <hex>` (or the library's `sign_transaction_kinds`).
+  Taproot (Schnorr) is *not* supported.
 - `--sighash` accepts `1` (ALL), `2` (NONE), `3` (SINGLE), `+0x80` for
   ANYONECANPAY; the legacy and BIP143 rules are both implemented, including the
   known `SIGHASH_SINGLE` bug.
 - `unsigned` + `signraw` let you build the transaction with one tool and sign it
   elsewhere; `decode` prints a transaction and extracts the `r`/`s` from each
   witness.
-- **Testnet/regtest only for real use.** Never paste a mainnet key into a tool
-  you have not audited, and remember these are hot keys.
+- **Defaults are mainnet and P2PKH** (see [Defaults](#defaults)). That means
+  real coins if you broadcast. Never paste a mainnet key into a tool you have
+  not audited, and remember these are hot keys. Add `--network testnet` (or
+  `regtest`) to practise on worthless coins.
 
 ### The real signature-forgery condition: the SIGHASH_SINGLE bug
 
@@ -281,7 +355,7 @@ Spending 150000 sats (vout 0)
 Address to send to: 1LhsLSUhjKiBWC3NTLZ7LeXPAdXXnDDg9c
 Amount to send in satoshis (max 149000) [149000]: 120000
 
-network:   testnet
+network:   mainnet
 txid:   671defe7b48b6e4338eeb01ee3e5998c4f55a0a5623ac01fb603b5876e790771
 output 0: 120000 sats -> 1LhsLSUhjKiBWC3NTLZ7LeXPAdXXnDDg9c
 output 1: 29000 sats -> 1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9
@@ -315,6 +389,10 @@ outputs (skipping ones with a `spent_by`), and uses the real value.
 python -m faketoshi spend --json --key <hex> \
     --txid <txid> --address <addr> --amount 120000 [--broadcast]
 ```
+
+Pass `--from <address>` to assert which address the coins sit on (see
+[Which address am I spending from?](#which-address-am-i-spending-from)); it is
+checked before anything is signed.
 
 `--json` prints only JSON (no prompts), requires `--txid`/`--address`/`--amount`,
 and infers `--vout` when the transaction has exactly one unspent output.
