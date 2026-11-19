@@ -99,14 +99,31 @@ def build_parser() -> argparse.ArgumentParser:
     keygen = subparsers.add_parser(
         'keygen', help='generate a private key with its address and WIF'
     )
-    keygen.add_argument('--network', default='testnet', help='mainnet, testnet or regtest')
+    keygen.add_argument(
+        '--network',
+        default='mainnet',
+        choices=['mainnet', 'testnet', 'regtest'],
+        help='mainnet (default), testnet or regtest',
+    )
+    keygen.add_argument(
+        '--kind',
+        default=InputKind.P2PKH,
+        choices=[InputKind.P2PKH, InputKind.P2WPKH],
+        help='address type (default p2pkh; p2wpkh for bech32)',
+    )
     keygen.add_argument('--json', action='store_true')
 
     address = subparsers.add_parser(
         'address', help='show the address/public key for a private key'
     )
     _add_key_source(address)
-    address.add_argument('--network', default='testnet')
+    address.add_argument('--network', default='mainnet', choices=['mainnet', 'testnet', 'regtest'])
+    address.add_argument(
+        '--kind',
+        default=InputKind.P2PKH,
+        choices=[InputKind.P2PKH, InputKind.P2WPKH],
+        help='address type (default p2pkh; p2wpkh for bech32)',
+    )
     address.add_argument('--json', action='store_true')
 
     sign = subparsers.add_parser(
@@ -132,7 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_key_source(tx)
-    tx.add_argument('--network', default='testnet')
+    tx.add_argument('--network', default='mainnet', choices=['mainnet', 'testnet', 'regtest'])
     tx.add_argument(
         '--input',
         action='append',
@@ -149,9 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tx.add_argument(
         '--kind',
-        default=InputKind.P2WPKH,
-        choices=[InputKind.P2WPKH, InputKind.P2PKH],
-        help='script type of the coins being spent',
+        default=InputKind.P2PKH,
+        choices=[InputKind.P2PKH, InputKind.P2WPKH],
+        help='script type of the coins being spent (default p2pkh)',
     )
     tx.add_argument('--sighash', type=lambda v: int(v, 0), default=0x01, help='sighash type, default 1')
     tx.add_argument('--version', type=int, default=2)
@@ -164,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unsigned.add_argument('--input', action='append', required=True, metavar='TXID:VOUT:AMOUNT_SATS[:SEQUENCE]')
     unsigned.add_argument('--output', action='append', required=True, metavar='ADDRESS:SATS')
-    unsigned.add_argument('--network', default='testnet')
+    unsigned.add_argument('--network', default='mainnet', choices=['mainnet', 'testnet', 'regtest'])
     unsigned.add_argument('--version', type=int, default=2)
     unsigned.add_argument('--locktime', type=int, default=0)
 
@@ -265,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_key_source(spend)
-    spend.add_argument('--network', default='testnet', choices=sorted(_CHAINS))
+    spend.add_argument('--network', default='mainnet', choices=sorted(_CHAINS))
     spend.add_argument('--token', default=None, help='BlockCypher token (prefer the env var)')
     spend.add_argument('--txid', help='previous transaction id (asked for if omitted)')
     spend.add_argument('--vout', type=int, help='output index to spend')
@@ -275,9 +292,9 @@ def build_parser() -> argparse.ArgumentParser:
     spend.add_argument('--change', help='change address (defaults to your own address)')
     spend.add_argument(
         '--kind',
-        default=InputKind.P2WPKH,
-        choices=[InputKind.P2WPKH, InputKind.P2PKH],
-        help='script type of the coin being spent',
+        default=InputKind.P2PKH,
+        choices=[InputKind.P2PKH, InputKind.P2WPKH],
+        help='script type of the coin being spent (default p2pkh)',
     )
     spend.add_argument(
         '--offline',
@@ -398,7 +415,7 @@ def _keygen(args) -> int:
     from .wallet import key_info as _key_info
 
     private_key = resolve_private_key()
-    address, wif, pubkey = _key_info(private_key, args.network)
+    address, wif, pubkey = _key_info(private_key, args.network, args.kind)
     payload = {
         'network': args.network,
         'private_key': '%064x' % private_key,
@@ -417,7 +434,7 @@ def _keygen(args) -> int:
 def _address(args) -> int:
     try:
         private_key = resolve_private_key(args.wif, args.key)
-        address, wif, pubkey = key_info(private_key, args.network)
+        address, wif, pubkey = key_info(private_key, args.network, args.kind)
     except ValueError as exc:
         return _fail(exc)
     payload = {
@@ -851,7 +868,7 @@ def _spend(args) -> int:
         private_key = resolve_private_key(args.wif, args.key)
     except ValueError as exc:
         return _fail(exc)
-    address, wif, pubkey = key_info(private_key, network)
+    address, wif, pubkey = key_info(private_key, network, args.kind)
 
     # --- 1. which coins? ask for the txid, then read the amount from the chain
     if interactive:
