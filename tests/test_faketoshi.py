@@ -358,5 +358,200 @@ class VerifyCliTest(unittest.TestCase):
         self.assertEqual(int(payload['txid'], 16), int(payload['msg_hash']))
 
 
+
+class AddressAllCliTest(unittest.TestCase):
+    """`address --all` should list every address a key controls."""
+
+    KEY = '11' * 32
+
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_all_lists_the_four_address_types(self):
+        rc, out, _ = self._run(['address', '--key', self.KEY, '--all'])
+        self.assertEqual(rc, 0)
+        self.assertIn('1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9', out)
+        self.assertIn('bc1ql3e9pgs3mmwuwrh95fecme0s0qtn2880lsvsd5', out)
+        self.assertIn('1MsHWS1BnwMc3tLE8G35UXsS58fKipzB7a', out)
+        self.assertIn('3PFpzMLrKWsphFtc8BesF3MGPnimKMuF4x', out)
+
+    def test_all_states_the_key_format(self):
+        rc, out, _ = self._run(['address', '--key', self.KEY, '--all'])
+        self.assertEqual(rc, 0)
+        self.assertIn('compressed', out)
+        self.assertIn('signing with: p2pkh', out)
+
+    def test_all_marks_the_default_kind(self):
+        rc, out, _ = self._run(['address', '--key', self.KEY, '--all'])
+        self.assertEqual(rc, 0)
+        import re
+
+        # Address lines look like "* p2pkh    <address>"; skip the legend line.
+        starred = [
+            line for line in out.splitlines()
+            if re.match(r'^\* \S+\s{2,}\S+$', line)
+        ]
+        self.assertEqual(len(starred), 1)
+        self.assertRegex(starred[0], r'^\* p2pkh\s')
+        self.assertNotIn('uncompressed', starred[0])
+
+    def test_all_json(self):
+        import json
+
+        rc, out, _ = self._run(['address', '--key', self.KEY, '--all', '--json'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(out)
+        self.assertEqual(payload['network'], 'mainnet')
+        self.assertTrue(payload['compressed'])
+        self.assertEqual(
+            set(payload['addresses']),
+            {'p2pkh', 'p2wpkh', 'p2pkh-uncompressed', 'p2sh-p2wpkh'},
+        )
+        self.assertEqual(
+            payload['addresses']['p2pkh']['address'],
+            '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9',
+        )
+
+    def test_without_all_only_the_default_address_is_printed(self):
+        rc, out, _ = self._run(['address', '--key', self.KEY, '--json'])
+        self.assertEqual(rc, 0)
+        import json
+
+        payload = json.loads(out)
+        self.assertNotIn('addresses', payload)
+        self.assertEqual(payload['address'], '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9')
+
+
+class SpendFromCliTest(unittest.TestCase):
+    """`spend --from` should confirm (or refuse) the address being spent."""
+
+    KEY = '11' * 32
+    P2PKH = '1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9'
+    P2WPKH = 'bc1ql3e9pgs3mmwuwrh95fecme0s0qtn2880lsvsd5'
+    P2PKH_UNCOMPRESSED = '1MsHWS1BnwMc3tLE8G35UXsS58fKipzB7a'
+    P2SH = '3PFpzMLrKWsphFtc8BesF3MGPnimKMuF4x'
+
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_matching_address_is_accepted(self):
+        # Stops at the first interactive prompt, which is enough to prove the
+        # --from check passed.
+        import builtins
+        from unittest import mock
+
+        with mock.patch.object(builtins, 'input', side_effect=EOFError):
+            rc, out, _ = self._run(['spend', '--key', self.KEY, '--from', self.P2PKH])
+        self.assertIn('matches your key', out)
+
+    def test_unknown_address_is_refused_and_lists_candidates(self):
+        rc, out, err = self._run(
+            ['spend', '--key', self.KEY, '--from', '1BoatSLRHtKNngkdXEeobR76b53LETtpyT']
+        )
+        self.assertEqual(rc, 2)
+        text = out + err
+        self.assertIn('is not an address this key controls', text)
+        self.assertIn(self.P2PKH, text)
+
+    def test_uncompressed_address_is_refused_with_the_right_one(self):
+        rc, out, err = self._run(
+            ['spend', '--key', self.KEY, '--from', self.P2PKH_UNCOMPRESSED]
+        )
+        self.assertEqual(rc, 2)
+        text = out + err
+        self.assertIn('uncompressed', text)
+        self.assertIn(self.P2PKH, text)
+
+    def test_segwit_address_needs_the_matching_kind(self):
+        rc, out, err = self._run(
+            ['spend', '--key', self.KEY, '--from', self.P2WPKH]
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('--kind p2wpkh', out + err)
+
+    def test_wrapped_segwit_address_points_at_signraw(self):
+        rc, out, err = self._run(['spend', '--key', self.KEY, '--from', self.P2SH])
+        self.assertEqual(rc, 2)
+        text = out + err
+        self.assertIn('wrapped-segwit', text)
+        self.assertIn('signraw --redeem-script', text)
+
+
+class SignRawRedeemScriptCliTest(unittest.TestCase):
+    """Spending P2SH-P2WPKH coins requires passing the redeemScript."""
+
+    KEY = '11' * 32
+
+    def _run(self, argv):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _fixture(self):
+        from faketoshi.encoding import hash160, push_data
+        from faketoshi.signing import private_key_to_public_key
+        from faketoshi.wallet import make_unsigned
+
+        pubkey = private_key_to_public_key(int(self.KEY, 16), compressed=True)
+        redeem = b'\x00\x14' + hash160(pubkey)
+        spk = b'\xa9' + push_data(hash160(redeem)) + b'\x87'
+        unsigned = make_unsigned(
+            ['aa' * 32 + ':0:100000'], ['1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9:90000']
+        )
+        return unsigned.hex(), spk.hex(), redeem.hex()
+
+    def test_redeem_script_produces_a_segwit_signature(self):
+        import json
+
+        raw, spk, redeem = self._fixture()
+        rc, out, err = self._run(
+            [
+                'signraw', '--key', self.KEY, '--raw', raw,
+                '--prevout', '%s:100000' % spk,
+                '--redeem-script', redeem, '--json',
+            ]
+        )
+        self.assertEqual(rc, 0, err)
+        payload = json.loads(out)
+        self.assertEqual(payload['address'], '3PFpzMLrKWsphFtc8BesF3MGPnimKMuF4x')
+        self.assertIn('p2sh-p2wpkh', json.dumps(payload))
+
+    def test_p2sh_prevout_without_redeem_script_explains_the_fix(self):
+        raw, spk, _ = self._fixture()
+        rc, out, err = self._run(
+            ['signraw', '--key', self.KEY, '--raw', raw, '--prevout', '%s:100000' % spk]
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('--redeem-script', out + err)
+
+    def test_mismatched_redeem_script_is_refused(self):
+        raw, _, _ = self._fixture()
+        rc, out, err = self._run(
+            [
+                'signraw', '--key', self.KEY, '--raw', raw,
+                '--prevout', '%s:100000' % ('76a914' + '11' * 20 + '88ac'),
+                '--redeem-script', '0014' + '22' * 20,
+            ]
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn('no --prevout matches that redeemScript', out + err)
+
+
 if __name__ == '__main__':
     unittest.main()
