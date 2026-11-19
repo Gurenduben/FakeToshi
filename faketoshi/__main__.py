@@ -31,6 +31,7 @@ from .signing import (
     sign_z,
     verify_z,
 )
+from .blockcypher import BlockCypherClient, BlockCypherError, CHAINS as _CHAINS
 from .wallet import (
     address_to_script,
     build_transaction,
@@ -228,6 +229,52 @@ def build_parser() -> argparse.ArgumentParser:
     serialize.add_argument('--sequence', type=lambda v: int(v, 0), default=0xFFFFFFFF)
     serialize.add_argument('--version', type=int, default=2)
     serialize.add_argument('--locktime', type=int, default=0)
+
+    # -- BlockCypher network access ---------------------------------------
+
+    unspent = subparsers.add_parser(
+        'unspent',
+        help='list unspent outputs for an address via BlockCypher',
+        description=(
+            'Query BlockCypher for the unspent outputs of an address. The token is '
+            'read from $BLOCKCYPHER_TOKEN unless --token is given; lookups work '
+            'unauthenticated at a lower rate limit.'
+        ),
+    )
+    unspent.add_argument('address')
+    unspent.add_argument('--network', default='mainnet', choices=sorted(_CHAINS))
+    unspent.add_argument('--token', default=None, help='API token (prefer the env var)')
+    unspent.add_argument('--min-confirmations', type=int, default=0)
+    unspent.add_argument(
+        '--confirmed-only', action='store_true', help='ignore unconfirmed outputs'
+    )
+    unspent.add_argument(
+        '--input-specs', action='store_true', help='print TXID:VOUT:AMOUNT lines only'
+    )
+    unspent.add_argument('--json', action='store_true')
+
+    balance = subparsers.add_parser('balance', help='address balance via BlockCypher')
+    balance.add_argument('address')
+    balance.add_argument('--network', default='mainnet', choices=sorted(_CHAINS))
+    balance.add_argument('--token', default=None)
+    balance.add_argument('--json', action='store_true')
+
+    broadcast = subparsers.add_parser(
+        'broadcast',
+        help='push a signed raw transaction to the network via BlockCypher',
+        description=(
+            'Broadcast a signed transaction. This is irreversible and spends real '
+            'coins on mainnet: the raw hex is decoded locally first and the txid is '
+            'printed, so check it before you confirm.'
+        ),
+    )
+    broadcast.add_argument('raw', help='signed transaction hex, or - to read stdin')
+    broadcast.add_argument('--network', default='mainnet', choices=sorted(_CHAINS))
+    broadcast.add_argument('--token', default=None)
+    broadcast.add_argument(
+        '--yes', action='store_true', help='skip the interactive confirmation prompt'
+    )
+    broadcast.add_argument('--json', action='store_true')
 
     decode = subparsers.add_parser('decode', help='decode a raw transaction')
     decode.add_argument('raw', help='raw transaction hex')
@@ -691,7 +738,118 @@ def _serialize(args) -> int:
     return 0
 
 
+def _client(args):
+    return BlockCypherClient(token=args.token, network=args.network)
+
+
+def _unspent(args) -> int:
+    try:
+        utxos = _client(args).unspent_outputs(
+            args.address, include_unconfirmed=not args.confirmed_only
+        )
+    except (BlockCypherError, ValueError) as exc:
+        return _fail(exc)
+
+    utxos = [u for u in utxos if u.confirmations >= args.min_confirmations]
+
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        'txid': u.tx_hash,
+                        'vout': u.tx_output_n,
+                        'value': u.value,
+                        'confirmations': u.confirmations,
+                        'input_spec': u.input_spec(),
+                    }
+                    for u in utxos
+                ],
+                indent=2,
+            )
+        )
+        return 0
+
+    if not utxos:
+        print('no unspent outputs found for %s' % args.address)
+        return 0
+
+    if args.input_specs:
+        for utxo in utxos:
+            print(utxo.input_spec())
+    else:
+        for utxo in utxos:
+            print(utxo)
+        print('%d output(s), %d sats total' % (len(utxos), sum(u.value for u in utxos)))
+    return 0
+
+
+def _balance(args) -> int:
+    try:
+        data = _client(args).balance(args.address)
+    except (BlockCypherError, ValueError) as exc:
+        return _fail(exc)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print('address:            %s' % data.get('address', args.address))
+        print('balance:            %d sats' % int(data.get('balance', 0)))
+        print('unconfirmed:        %d sats' % int(data.get('unconfirmed_balance', 0)))
+        print('total:              %d sats' % int(data.get('final_balance', 0)))
+        print('transactions:       %d' % int(data.get('final_n_tx', 0)))
+    return 0
+
+
+def _broadcast(args) -> int:
+    raw = args.raw
+    if raw == '-':
+        raw = sys.stdin.read()
+    try:
+        tx = parse_transaction_hex(raw)
+    except ValueError as exc:
+        return _fail(exc)
+
+    if not args.json:
+        print('network:  %s' % args.network)
+        print('txid:     %s' % tx.txid())
+        print('size:     %d bytes' % len(tx.serialize()))
+        for i, txout in enumerate(tx.outputs):
+            print('output %d: %d sats' % (i, txout.value))
+
+    if not args.yes and not args.json:
+        if not sys.stdin.isatty():
+            return _fail(
+                ValueError(
+                    'refusing to broadcast without confirmation: pass --yes '
+                    '(or use --json) once you have checked the txid above'
+                )
+            )
+        answer = input('broadcast this transaction? [y/N] ').strip().lower()
+        if answer not in ('y', 'yes'):
+            print('aborted; nothing was broadcast')
+            return 1
+
+    try:
+        result = _client(args).push(tx.hex())
+    except (BlockCypherError, ValueError) as exc:
+        return _fail(exc)
+
+    if args.json:
+        print(json.dumps({'txid': result.tx_hash, 'response': result.raw}, indent=2))
+    else:
+        print(result)
+        if result.tx_hash and result.tx_hash != tx.txid():
+            print(
+                'warning: the node reported a different txid (%s) than the local '
+                'computation (%s)' % (result.tx_hash, tx.txid())
+            )
+    return 0
+
+
 _HANDLERS = {
+    'unspent': _unspent,
+    'balance': _balance,
+    'broadcast': _broadcast,
     'sighash-single-demo': _analyse,
     'scriptsig': _scriptsig,
     'redeemscript': _redeemscript,

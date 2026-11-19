@@ -4,3 +4,7 @@ __pycache__/
 build/
 dist/
 .venv/
+
+# never commit API tokens
+.env
+*.token

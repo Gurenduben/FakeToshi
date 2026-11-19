@@ -11,6 +11,12 @@ from .curve import (
     point_from_x,
     point_mul,
 )
+from .blockcypher import (
+    BlockCypherClient,
+    BlockCypherError,
+    BroadcastResult,
+    Utxo,
+)
 from .sighash_single import (
     MultisigWallet,
     analyse_sighash_single,
@@ -60,6 +66,10 @@ from .faketoshi import (
 )
 
 __all__ = [
+    'BlockCypherClient',
+    'BlockCypherError',
+    'BroadcastResult',
+    'Utxo',
     'MultisigWallet',
     'analyse_sighash_single',
     'demonstrate_sighash_single_bug',

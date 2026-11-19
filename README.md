@@ -261,6 +261,48 @@ Bitcoin. Its notebook only shells out to a prebuilt binary downloaded from a
 third-party site. Nothing here executes that binary or relies on it; all the
 cryptography is this repository's own, checked against the vectors above.
 
+### Live UTXOs and broadcasting (BlockCypher)
+
+`unspent` lists real unspent outputs, ready to paste into `--input`:
+
+```
+$ export BLOCKCYPHER_TOKEN=...                     # only if you have one
+$ python -m faketoshi unspent 32GkPB9XjMAELR4Q2Hr31Jdz2tntY18zCe --input-specs
+7e3c...e21:0:677200
+9a10...ff4:1:5000000
+```
+
+and `broadcast` pushes a signed transaction:
+
+```
+$ python -m faketoshi tx --key <hex> --network testnet \
+      --input <utxo-spec> --output <address>:<sats> --json | jq -r .hex > tx.hex
+$ python -m faketoshi broadcast - --network testnet < tx.hex
+network:  testnet
+txid:     2ad83856c35e86d6e2f9ee2d2e7f9218b32a337a7b216c579a411327c3fdfc58
+size:     191 bytes
+output 0: 90000 sats
+broadcast this transaction? [y/N]
+```
+
+Safety behaviour, by design:
+
+- **The token is read from `$BLOCKCYPHER_TOKEN`** (or `--token`). It is never
+  written to disk, and it is stripped from error messages — `unspent` works
+  unauthenticated at BlockCypher's lower rate limit if you have no token.
+- `unspent` skips outputs that are already spent and rows that are inputs
+  rather than outputs, sorts largest-first (fewer inputs, lower fees), and can
+  filter with `--confirmed-only` / `--min-confirmations`.
+- `broadcast` **decodes and checks the transaction locally first**, prints the
+  txid and outputs, and asks for confirmation (`--yes` to skip, `--json` for
+  scripted use). It refuses to proceed non-interactively without `--yes`.
+- After pushing, it compares the node's reported txid with the locally computed
+  one and warns on a mismatch — a cheap sanity check that the hex you sent is
+  the transaction you built.
+- `--network` maps to BlockCypher chains: `mainnet` → `btc/main`,
+  `testnet` → `btc/test3`. **Broadcasting on mainnet spends real coins and
+  cannot be undone.**
+
 ### As a library
 
 ```python
@@ -330,6 +372,7 @@ Signing and transactions are separate from the forgery code:
 | `faketoshi/signing.py` | RFC 6979 nonces, `sign_z`/`verify_z`, DER, legacy and BIP143 sighashes, tx parsing/serialisation, `txid`/`wtxid` |
 | `faketoshi/wallet.py` | address ↔ script, WIF, `build_transaction`, `sign_raw_transaction`, `make_unsigned` |
 | `faketoshi/encoding.py` | hashes (incl. pure-Python RIPEMD160 fallback), varints, base58check, bech32 |
+| `faketoshi/blockcypher.py` | BlockCypher client: `unspent_outputs`, `balance`, `push`, `decode`; injectable transport for tests |
 | `faketoshi/sighash_single.py` | multisig scripts, scriptSig parsing, the SIGHASH_SINGLE demo, `analyse_sighash_single`, `replay_signature` |
 
 Signatures and sighashes were cross-checked against the third-party
