@@ -32,7 +32,10 @@ CHAINS = {
     'testnet': 'btc/test3',
 }
 
-TOKEN_ENV_VAR = '7aa0e95049c041eeb177c0ec308aaac6'
+#: Name of the environment variable holding the API token. This must stay the
+#: variable *name* (never a token value): resolve_token() looks it up in the
+#: environment, so replacing it with the secret silently disables token auth.
+TOKEN_ENV_VAR = 'BLOCKCYPHER_TOKEN'
 
 
 class BlockCypherError(RuntimeError):
