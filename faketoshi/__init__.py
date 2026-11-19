@@ -11,6 +11,29 @@ from .curve import (
     point_from_x,
     point_mul,
 )
+from .signing import (
+    SIGHASH_ALL,
+    SIGHASH_ANYONECANPAY,
+    SIGHASH_NONE,
+    SIGHASH_SINGLE,
+    Transaction,
+    der_decode,
+    der_encode,
+    generate_private_key,
+    parse_transaction,
+    private_key_to_public_key,
+    private_key_to_wif,
+    sign_z,
+    verify_z,
+    wif_to_private_key,
+)
+from .wallet import (
+    address_to_script,
+    build_transaction,
+    key_info,
+    make_unsigned,
+    sign_raw_transaction,
+)
 from .faketoshi import (
     FaketoshiCredentials,
     Inspection,
@@ -26,6 +49,25 @@ from .faketoshi import (
 )
 
 __all__ = [
+    'SIGHASH_ALL',
+    'SIGHASH_ANYONECANPAY',
+    'SIGHASH_NONE',
+    'SIGHASH_SINGLE',
+    'Transaction',
+    'address_to_script',
+    'build_transaction',
+    'der_decode',
+    'der_encode',
+    'generate_private_key',
+    'key_info',
+    'make_unsigned',
+    'parse_transaction',
+    'private_key_to_public_key',
+    'private_key_to_wif',
+    'sign_raw_transaction',
+    'sign_z',
+    'verify_z',
+    'wif_to_private_key',
     'FaketoshiCredentials',
     'Inspection',
     'PublicKey',
